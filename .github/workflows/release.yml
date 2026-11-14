@@ -35,8 +35,9 @@ jobs:
     - run: |
         python3 -m venv env
         . env/bin/activate
+        pip install -r requirements_minimal.txt
         pip install .
-        pip install onnx onnxruntime
+        pip install onnx onnxruntime onnxscript
         ./scripts/convert-pth-to-onnx.py ./output
       name: Build
 
