@@ -55,6 +55,17 @@ if __name__ == '__main__':
             input_names=['input'],
             output_names=['output'],
         )
+
+        # The exporter stores the weights in a separate "<name>.onnx.data" file.
+        # Embed them so that the single .onnx file is complete.
+        import onnx
+
+        onnx_model = onnx.load(str(onnx_file_path))
+        onnx.save_model(onnx_model, str(onnx_file_path), save_as_external_data=False)
+        external_data_path = Path(f"{onnx_file_path}.data")
+        if external_data_path.exists():
+            external_data_path.unlink()
+
         print(f"Model successfully converted to ONNX format at {onnx_file_path}")
     except Exception as e:
         print("Error during ONNX export:", e)
