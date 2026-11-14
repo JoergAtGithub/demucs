@@ -42,7 +42,9 @@ def pad1d(
             x = F.pad(x, (extra_pad_left, extra_pad_right))
     out = F.pad(x, paddings, mode, value)
     assert out.shape[-1] == length + padding_left + padding_right
-    assert (out[..., padding_left: padding_left + length] == x0).all()
+    if not torch.compiler.is_exporting():
+        # Data-dependent check, cannot be traced by torch.export
+        assert (out[..., padding_left: padding_left + length] == x0).all()
     return out
 
 
