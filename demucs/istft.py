@@ -6,7 +6,7 @@
 # First author is Anmol Mishra.
 """
 This module implements a custom ISTFT process that is compatible with ONNX export.
-It uses PyTorch's convolution operations to compute the inverse STFT, avoiding the use of
+It uses PyTorch's matrix multiplication to compute the inverse STFT, avoiding the use of
 complex numbers directly, which can be problematic for ONNX export.
 """
 import torch
@@ -74,11 +74,17 @@ class ISTFT_Process(torch.nn.Module):
         self.max_frames = max_frames
         self.center = center
         self.half_n_fft = n_fft // 2  # Precompute once
+        self.overlap = n_fft // hop_len  # Number of frames overlapping each sample
 
         # Get window function and compute window once
         if self.window_length != self.n_fft:
             raise NotImplementedError(
                 "The case of window length not equal to n_fft is not implemented "
+                f"in {self.__class__.__name__}."
+            )
+        if self.n_fft % self.hop_len != 0:
+            raise NotImplementedError(
+                "The case of n_fft not being a multiple of hop_len is not implemented "
                 f"in {self.__class__.__name__}."
             )
         window = WindowType(window_type)(self.window_length).float()
@@ -90,36 +96,26 @@ class ISTFT_Process(torch.nn.Module):
             )
 
         # ISTFT forward pass preparation
-        # Pre-compute fourier basis
-        fourier_basis = torch.fft.fft(torch.eye(n_fft, dtype=torch.float32))
-        fourier_basis = torch.vstack(
-            [
-                torch.real(fourier_basis[: self.half_n_fft + 1, :]),
-                torch.imag(fourier_basis[: self.half_n_fft + 1, :]),
-            ]
-        ).float()
-
-        # Create forward and inverse basis
-        forward_basis = window * fourier_basis[:, None, :]
-        inverse_basis = (
-            window * torch.linalg.pinv((fourier_basis * n_fft) / hop_len).T[:, None, :]
+        time_steps = torch.arange(n_fft, dtype=torch.float32).unsqueeze(1)
+        frequencies = torch.arange(self.half_n_fft + 1, dtype=torch.float32).unsqueeze(
+            0
         )
+        omega = 2 * torch.pi * ((time_steps * frequencies) % n_fft) / n_fft
+
+        # Bins between DC and Nyquist appear twice in the full spectrum
+        scale = torch.ones(self.half_n_fft + 1)
+        scale[1:-1] = 2.0
+        scale = scale / n_fft
+
+        # Create inverse basis (window applied) of shape [2 * n_freqs, n_fft]
+        cos_inverse = (torch.cos(omega) * scale.unsqueeze(0) * window.unsqueeze(1)).T
+        sin_inverse = (-torch.sin(omega) * scale.unsqueeze(0) * window.unsqueeze(1)).T
+        inverse_basis = torch.cat([cos_inverse, sin_inverse], dim=0)
 
         # Calculate window sum for overlap-add
         n = n_fft + hop_len * (max_frames - 1)
         window_sum = torch.zeros(n, dtype=torch.float32)
-        window_normalized = window / window.abs().max()
-
-        # Pad window if needed
-        total_pad = n_fft - window_normalized.shape[0]
-        if total_pad > 0:
-            pad_left = total_pad // 2
-            pad_right = total_pad - pad_left
-            win_sq = torch.nn.functional.pad(
-                window_normalized**2, (pad_left, pad_right), mode="constant", value=0
-            )
-        else:
-            win_sq = window_normalized**2
+        win_sq = window**2
 
         # Calculate overlap-add weights
         for i in range(max_frames):
@@ -135,41 +131,42 @@ class ISTFT_Process(torch.nn.Module):
             )
 
         # Register buffers
-        self.register_buffer("forward_basis", forward_basis)
         self.register_buffer("inverse_basis", inverse_basis)
         self.register_buffer(
-            "window_sum_inv", n_fft / (window_sum * hop_len + 1e-8)
-        )  # Add epsilon to avoid division by zero
+            "window_sum_inv", 1.0 / torch.clamp(window_sum, min=1e-8)
+        )  # Clamp to avoid division by zero
 
     def forward(self, real, imag, length=None):
-        # Calculate magnitude and phase from real and imaginary parts
-        magnitude = torch.sqrt(real**2 + imag**2)
-        phase = torch.atan2(
-            imag, real + torch.finfo(real.dtype).eps
-        )  # Add epsilon to avoid division by zero
+        # Prepare input for matrix multiplication: [batch, frames, 2 * n_freqs]
+        complex_input = torch.cat((real, imag), dim=1).transpose(-1, -2)
 
-        # Pre-compute trig values
-        cos_phase = torch.cos(phase)
-        sin_phase = torch.sin(phase)
+        # Perform matrix multiplication: [batch, frames, n_fft]
+        batch_size = complex_input.shape[0]
+        inverse_frames = torch.matmul(complex_input, self.inverse_basis)
 
-        # Prepare input for transposed convolution
-        complex_input = torch.cat((magnitude * cos_phase, magnitude * sin_phase), dim=1)
-
-        # Perform transposed convolution
-        inverse_transform = torch.nn.functional.conv_transpose1d(
-            complex_input,
-            self.inverse_basis,
-            stride=self.hop_len,
-            padding=0,
+        # Overlap-add without fold: add `overlap` shifted, non-overlapping reshape passes
+        num_frames = inverse_frames.shape[1]
+        output_len = (num_frames - 1) * self.hop_len + self.n_fft
+        inverse_transform = torch.zeros(
+            (batch_size, output_len),
+            dtype=inverse_frames.dtype,
+            device=inverse_frames.device,
         )
+        for offset in range(self.overlap):
+            sub_frames = inverse_frames[:, offset:: self.overlap, :]
+            num_sub_frames = sub_frames.shape[1]
+            if num_sub_frames > 0:
+                flat = sub_frames.reshape(batch_size, num_sub_frames * self.n_fft)
+                start = offset * self.hop_len
+                end = start + num_sub_frames * self.n_fft
+                inverse_transform[:, start:end] = inverse_transform[:, start:end] + flat
 
         # Apply window correction
-        output_len = inverse_transform.size(-1)
         start_idx = self.half_n_fft
         end_idx = output_len
 
         output = (
-            inverse_transform[:, :, start_idx:end_idx]
+            inverse_transform[:, start_idx:end_idx]
             * self.window_sum_inv[start_idx:end_idx]
         )
 
@@ -180,7 +177,6 @@ class ISTFT_Process(torch.nn.Module):
             # Create a zero pad tensor regardless of need
             pad = torch.zeros(
                 output.size(0),
-                output.size(1),
                 pad_len,
                 dtype=output.dtype,
                 device=output.device,
@@ -192,7 +188,6 @@ class ISTFT_Process(torch.nn.Module):
             # Crop in all cases to enforce exact length
             output = output[..., :length]
 
-        output = output.squeeze(dim=1)
         return output
 
 
