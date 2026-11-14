@@ -61,6 +61,17 @@ if __name__ == '__main__':
         import onnx
 
         onnx_model = onnx.load(str(onnx_file_path))
+
+        # The exporter adds a `constant_value` input to non-constant Pad nodes.
+        # It is ignored by the ONNX spec in these modes, but MIGraphX (AMD) treats
+        # the third input of such nodes as `axes` and fails to parse the model.
+        for node in onnx_model.graph.node:
+            if node.op_type != "Pad" or len(node.input) != 3:
+                continue
+            mode = next((a.s for a in node.attribute if a.name == "mode"), b"constant")
+            if mode != b"constant":
+                del node.input[2]
+
         onnx.save_model(onnx_model, str(onnx_file_path), save_as_external_data=False)
         external_data_path = Path(f"{onnx_file_path}.data")
         if external_data_path.exists():
