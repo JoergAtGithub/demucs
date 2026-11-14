@@ -9,6 +9,7 @@ This module implements a custom STFT process that is compatible with ONNX export
 It uses PyTorch's convolution operations to compute the STFT, avoiding the use of complex
 numbers directly, which can be problematic for ONNX export.
 """
+import math
 import torch
 import enum
 
@@ -100,11 +101,27 @@ class STFT_Process(torch.nn.Module):
                 torch.tensor([n_fft], dtype=torch.float32)
             )
 
-        # Register conv kernels as buffers
-        self.register_buffer("cos_kernel", (cos_kernel))
-        self.register_buffer("sin_kernel", (sin_kernel))
+        # Register the DFT matrix [n_fft, 2 * n_freqs] as buffer (cos part, then sin part)
+        dft_matrix = torch.cat([cos_kernel.squeeze(1).T, sin_kernel.squeeze(1).T], dim=1)
+        self.register_buffer("dft_matrix", dft_matrix)
+        self._frame_idx_cache = {}
+
+    def _frame_idx(self, padded_length, device):
+        key = (padded_length, device)
+        if key not in self._frame_idx_cache:
+            num_frames = (padded_length - self.n_fft) // self.hop_len + 1
+            frame_indices = (
+                torch.arange(self.n_fft).unsqueeze(0)
+                + torch.arange(num_frames).unsqueeze(1) * self.hop_len
+            )
+            self._frame_idx_cache[key] = (
+                frame_indices.reshape(-1).to(device),
+                num_frames,
+            )
+        return self._frame_idx_cache[key]
 
     def forward(self, x):
+        batch_size, num_channels, _ = x.shape
         if self.center:
             x_padded = torch.nn.functional.pad(
                 x, (self.half_n_fft, self.half_n_fft), mode=self.pad_mode
@@ -112,13 +129,16 @@ class STFT_Process(torch.nn.Module):
         else:
             x_padded = x
 
-        # Perform convolutions
-        real_part = torch.nn.functional.conv1d(
-            x_padded, self.cos_kernel, stride=self.hop_len
-        )
-        image_part = torch.nn.functional.conv1d(
-            x_padded, self.sin_kernel, stride=self.hop_len
-        )
+        # Gather + reshape instead of unfold()
+        frame_indices, num_frames = self._frame_idx(x_padded.shape[-1], x.device)
+        frames = torch.index_select(x_padded, dim=-1, index=frame_indices)
+        frames = frames.reshape(batch_size, num_channels, num_frames, self.n_fft)
+
+        # Perform matrix multiplication with the DFT matrix
+        spec = torch.matmul(frames, self.dft_matrix)
+        n_freqs = self.half_n_fft + 1
+        real_part = spec[..., :n_freqs].transpose(-1, -2).squeeze(1)
+        image_part = spec[..., n_freqs:].transpose(-1, -2).squeeze(1)
 
         # return real_part, image_part
         return torch.stack((real_part, image_part), dim=-1)
