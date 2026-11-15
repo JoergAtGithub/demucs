@@ -248,6 +248,19 @@ class ScaledEmbedding(nn.Module):
         return self.embedding(x) * self.boost
 
 
+class SliceGLU(nn.Module):
+    """GLU written with two slices instead of a Split. Identical result, but
+    DirectML computes Split(num_outputs) incorrectly."""
+
+    def __init__(self, dim: int = 1):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        half = x.shape[self.dim] // 2
+        return x.narrow(self.dim, 0, half) * torch.sigmoid(x.narrow(self.dim, half, half))
+
+
 class LayerScale(nn.Module):
     """Layer scale from [Touvron et al 2021] (https://arxiv.org/pdf/2103.17239.pdf).
     This rescales diagonaly residual outputs close to 0 initially, then learnt.

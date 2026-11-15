@@ -12,6 +12,7 @@ from demucs.istft import ISTFT_Process
 
 DEMUCS_MODEL = "htdemucs"
 
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Convert Demucs PyTorch models to ONNX')
     parser.add_argument("dest_dir", type=str, help="destination path for the converted model")
@@ -76,10 +77,9 @@ if __name__ == '__main__':
             output_names=['output'],
         )
 
-        # The exporter stores the weights in a separate "<name>.onnx.data" file.
-        # Embed them so that the single .onnx file is complete.
+        # The exporter stores the weights in a separate "<name>.onnx.data" file.        # Embed them so that the single .onnx file is complete.
         import onnx
-
+        from onnx import numpy_helper
         onnx_model = onnx.load(str(onnx_file_path))
 
         # The exporter adds a `constant_value` input to non-constant Pad nodes.
@@ -91,6 +91,18 @@ if __name__ == '__main__':
             mode = next((a.s for a in node.attribute if a.name == "mode"), b"constant")
             if mode != b"constant":
                 del node.input[2]
+
+        # The exporter emits attributes that carry no information here but that
+        # DirectML rejects: Reshape allowzero=1 (the shapes contain no zeros) and
+        # ConvTranspose output_padding=[0].
+        init = {i.name: i for i in onnx_model.graph.initializer}
+        for node in onnx_model.graph.node:
+            for attr in list(node.attribute):
+                if node.op_type == "ConvTranspose" and attr.name == "output_padding" and not any(attr.ints):
+                    node.attribute.remove(attr)
+                elif node.op_type == "Reshape" and attr.name == "allowzero" and node.input[1] in init:
+                    if not (numpy_helper.to_array(init[node.input[1]]) == 0).any():
+                        node.attribute.remove(attr)
 
         onnx.save_model(onnx_model, str(onnx_file_path), save_as_external_data=False)
         external_data_path = Path(f"{onnx_file_path}.data")

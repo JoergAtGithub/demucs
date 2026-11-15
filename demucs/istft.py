@@ -216,8 +216,9 @@ class ISTFT_Process(torch.nn.Module):
         zi = zi * bin_scale
         lead = zr.shape[:-1]
         # bin k = k1 + R*k2 -> [.., k1, k2]
-        zr = zr.reshape(*lead, k2n, R).transpose(-1, -2)
-        zi = zi.reshape(*lead, k2n, R).transpose(-1, -2)
+        # one flat batch dim keeps every MatMul at rank 3 (DirectML supports at most rank 4)
+        zr = zr.reshape(-1, k2n, R).transpose(-1, -2)
+        zi = zi.reshape(-1, k2n, R).transpose(-1, -2)
         if k2n == self.k2_count:
             stage_a = self.stageA
         else:

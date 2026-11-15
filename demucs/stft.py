@@ -153,7 +153,7 @@ class STFT_Process(torch.nn.Module):
 
         # Window (and normalization) applied to the frames, in [n1, n2] layout
         scale = 1.0 / math.sqrt(N) if self.normalized else 1.0
-        self.register_buffer("window_scaled", (window.double() * scale).float().reshape(1, 1, 1, R, R))
+        self.register_buffer("window_scaled", (window.double() * scale).float().reshape(R, R))
 
         # Stage 1: [n1, k1] -> [cos | -sin]
         ang1 = two_pi * torch.outer(r, r) / R
@@ -176,14 +176,15 @@ class STFT_Process(torch.nn.Module):
         R = self.radix
         n_freqs = self.half_n_fft + 1
         lead = frames.shape[:-1]
-        x = frames.reshape(*lead, R, R) * self.window_scaled  # [.., n1, n2]
-        x = x.transpose(-1, -2)  # [.., n2, n1]
-        a = torch.matmul(x, self.stage1)  # [.., n2, 2*k1]
+        # one flat batch dim keeps every MatMul at rank 3 (DirectML supports at most rank 4)
+        x = frames.reshape(-1, R, R) * self.window_scaled  # [N, n1, n2]
+        x = x.transpose(-1, -2)  # [N, n2, n1]
+        a = torch.matmul(x, self.stage1)  # [N, n2, 2*k1]
         ar, ai = a[..., :R], a[..., R:]
         br = ar * self.twiddle_re - ai * self.twiddle_im
         bi = ar * self.twiddle_im + ai * self.twiddle_re
         b = torch.cat([br.transpose(-1, -2), bi.transpose(-1, -2)], dim=-1)  # [.., k1, 2*n2]
-        X = torch.matmul(b, self.stage2)  # [.., k1, 2*k2]
+        X = torch.matmul(b, self.stage2)  # [N, k1, 2*k2]
         k2n = self.k2_count
         xr = X[..., :k2n].transpose(-1, -2).reshape(*lead, k2n * R)[..., :n_freqs]
         xi = X[..., k2n:].transpose(-1, -2).reshape(*lead, k2n * R)[..., :n_freqs]

@@ -16,6 +16,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from .demucs import DConv, rescale_module
+from .transformer import SliceGLU
 from .states import capture_init
 from .spec import spectro, ispectro
 
@@ -176,7 +177,7 @@ class HEncLayer(nn.Module):
                 y = y.view(B, Fr, C, T).permute(0, 2, 1, 3)
         if self.rewrite:
             z = self.norm2(self.rewrite(y))
-            z = F.glu(z, dim=1)
+            z = SliceGLU(1)(z)
         else:
             z = y
         return z
@@ -353,7 +354,7 @@ class HDecLayer(nn.Module):
             x = x + skip
 
             if self.rewrite:
-                y = F.glu(self.norm1(self.rewrite(x)), dim=1)
+                y = SliceGLU(1)(self.norm1(self.rewrite(x)))
             else:
                 y = x
             if self.dconv:
