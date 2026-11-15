@@ -455,15 +455,15 @@ class HTDemucs(nn.Module):
 
     def _ispec(self, z, length=None, scale=0):
         hl = self.hop_length // (4**scale)
-        if self.onnx_exportable:
-            z = F.pad(z, (0, 0, 0, 0, 0, 1))  # add 0 padding for the last dim
-            z = F.pad(z, (0, 0, 2, 2))  # add 0 padding for the last dim
-        else:
-            z = F.pad(z, (0, 0, 0, 1))
-            z = F.pad(z, (2, 2))
         pad = hl // 2 * 3
+        if self.onnx_exportable:
+            # The zero bin / zero frames are handled implicitly inside the iSTFT (no Pad ops)
+            x = ispectro(z, hl, length=pad + length, onnx_exportable=True, zero_frames=2)
+            return x[..., pad: pad + length]
+        z = F.pad(z, (0, 0, 0, 1))
+        z = F.pad(z, (2, 2))
         le = hl * int(math.ceil(length / hl)) + 2 * pad
-        x = ispectro(z, hl, length=le, onnx_exportable=self.onnx_exportable)
+        x = ispectro(z, hl, length=le, onnx_exportable=False)
         x = x[..., pad: pad + length]
         return x
 

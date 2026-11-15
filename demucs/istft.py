@@ -203,15 +203,27 @@ class ISTFT_Process(torch.nn.Module):
 
     def _inverse_frames_factorized(self, real, imag):
         R = self.radix
-        pad = self.k2_count * R - self.n_freqs
-        pad_fn = torch.nn.functional.pad
-        zr = pad_fn(real.transpose(-1, -2), (0, pad)) * self.bin_scale
-        zi = pad_fn(imag.transpose(-1, -2), (0, pad)) * self.bin_scale
+        freqs_in = real.shape[1]
+        k2n = -(-freqs_in // R)
+        pad = k2n * R - freqs_in
+        zr = real.transpose(-1, -2)
+        zi = imag.transpose(-1, -2)
+        if pad:
+            zr = torch.nn.functional.pad(zr, (0, pad))
+            zi = torch.nn.functional.pad(zi, (0, pad))
+        bin_scale = self.bin_scale[: k2n * R]
+        zr = zr * bin_scale
+        zi = zi * bin_scale
         lead = zr.shape[:-1]
         # bin k = k1 + R*k2 -> [.., k1, k2]
-        zr = zr.reshape(*lead, self.k2_count, R).transpose(-1, -2)
-        zi = zi.reshape(*lead, self.k2_count, R).transpose(-1, -2)
-        b = torch.matmul(torch.cat([zr, zi], dim=-1), self.stageA)  # [.., k1, 2*n2]
+        zr = zr.reshape(*lead, k2n, R).transpose(-1, -2)
+        zi = zi.reshape(*lead, k2n, R).transpose(-1, -2)
+        if k2n == self.k2_count:
+            stage_a = self.stageA
+        else:
+            kc = self.k2_count
+            stage_a = torch.cat([self.stageA[:k2n], self.stageA[kc: kc + k2n]], dim=0)
+        b = torch.matmul(torch.cat([zr, zi], dim=-1), stage_a)  # [.., k1, 2*n2]
         br, bi = b[..., :R], b[..., R:]
         cr = br * self.twiddle_re - bi * self.twiddle_im
         ci = br * self.twiddle_im + bi * self.twiddle_re
@@ -220,49 +232,57 @@ class ISTFT_Process(torch.nn.Module):
         y = y.transpose(-1, -2) * self.window_scaled  # [.., n1, n2]
         return y.reshape(*lead, self.n_fft)
 
-    def forward(self, real, imag, length=None):
+    def forward(self, real, imag, length=None, zero_frames=0):
+        """real/imag: [batch, freqs, frames]. Missing high bins are treated as zero and
+        `zero_frames` all-zero frames are implicitly present on each side."""
         batch_size = real.shape[0]
         if self.factorized:
             # [batch, frames, n_fft]
             inverse_frames = self._inverse_frames_factorized(real, imag)
         else:
+            n_freqs = self.half_n_fft + 1
+            missing = n_freqs - real.shape[1]
+            if missing > 0:
+                real = torch.nn.functional.pad(real, (0, 0, 0, missing))
+                imag = torch.nn.functional.pad(imag, (0, 0, 0, missing))
             # Prepare input for matrix multiplication: [batch, frames, 2 * n_freqs]
             complex_input = torch.cat((real, imag), dim=1).transpose(-1, -2)
 
             # Perform matrix multiplication: [batch, frames, n_fft]
             inverse_frames = torch.matmul(complex_input, self.inverse_basis)
 
-        # Overlap-add without fold: add `overlap` shifted, non-overlapping reshape passes
+        # Overlap-add as one Conv2d: chunk j of the output is the sum over o of
+        # chunk o of frame (j - o). The shifts are conv padding (no Pad op).
         num_frames = inverse_frames.shape[1]
-        output_len = (num_frames - 1) * self.hop_len + self.n_fft
-        inverse_transform = None
-        for offset in range(self.overlap):
-            sub_frames = inverse_frames[:, offset:: self.overlap, :]
-            num_sub_frames = sub_frames.shape[1]
-            if num_sub_frames > 0:
-                flat = sub_frames.reshape(batch_size, num_sub_frames * self.n_fft)
-                start = offset * self.hop_len
-                end = start + num_sub_frames * self.n_fft
-                placed = torch.nn.functional.pad(flat, (start, output_len - end))
-                inverse_transform = (
-                    placed if inverse_transform is None else inverse_transform + placed
-                )
+        ov, hop = self.overlap, self.hop_len
+        x = inverse_frames.reshape(batch_size, num_frames, ov, hop).permute(0, 2, 1, 3)
+        weight = torch.zeros(1, ov, ov, 1, dtype=x.dtype, device=x.device)
+        for o in range(ov):
+            weight[0, o, ov - 1 - o, 0] = 1.0
+        core = torch.nn.functional.conv2d(x, weight, padding=(ov - 1, 0))
+        core = core.reshape(batch_size, (num_frames + ov - 1) * hop)
+        core_len = core.shape[-1]
 
-        # Apply window correction
-        start_idx = self.half_n_fft
-        end_idx = output_len
+        # Coordinates of the (virtual) zero-padded frame sequence
+        virtual_len = (num_frames + 2 * zero_frames - 1) * hop + self.n_fft
+        half = self.half_n_fft
+        out_len = virtual_len - half
+        target = out_len if not length else min(out_len, int(length))
 
-        output = (
-            inverse_transform[:, start_idx:end_idx]
-            * self.window_sum_inv[start_idx:end_idx]
-        )
+        shift = zero_frames * hop
+        start = half - shift
+        if start < 0:
+            core = torch.nn.functional.pad(core, (-start, 0))
+            start = 0
+        if start + target > core.shape[-1]:
+            core = torch.nn.functional.pad(core, (0, start + target - core.shape[-1]))
+        output = core[:, start: start + target] * self.window_sum_inv[half: half + target]
 
-        # If length is specified, trim the output to the desired length
+        # If length is specified, pad up to the desired length
         if length:
             pad_len = max(int(length) - int(output.size(-1)), 0)
             if pad_len > 0:
                 output = torch.nn.functional.pad(output, (0, pad_len))
-            output = output[..., :length]
 
         return output
 

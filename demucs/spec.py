@@ -41,7 +41,7 @@ def spectro(x, n_fft=512, hop_length=None, pad=0, onnx_exportable=False):
     return z.view(*other, freqs, frame)
 
 
-def ispectro(z, hop_length=None, length=None, pad=0, onnx_exportable=False):
+def ispectro(z, hop_length=None, length=None, pad=0, onnx_exportable=False, zero_frames=0):
     if onnx_exportable:
         # B, S, -1, Fr, T  (complex)      ----->     # B, S, -1, Fr, T, 2 shape
         *other, freqs, frames, dim = z.shape  # dim is 2
@@ -52,7 +52,7 @@ def ispectro(z, hop_length=None, length=None, pad=0, onnx_exportable=False):
         is_mps_xpu = z.device.type in ["mps", "xpu"]
         if is_mps_xpu:
             z = z.cpu()
-        x = demucs_istft(z[..., 0], z[..., 1], length=length)
+        x = demucs_istft(z[..., 0], z[..., 1], length=length, zero_frames=zero_frames)
         _, length = x.shape
         return x.view(*other, length)
 
