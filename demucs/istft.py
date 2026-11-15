@@ -9,6 +9,7 @@ This module implements a custom ISTFT process that is compatible with ONNX expor
 It uses PyTorch's matrix multiplication to compute the inverse STFT, avoiding the use of
 complex numbers directly, which can be problematic for ONNX export.
 """
+import math
 import torch
 import enum
 
@@ -64,6 +65,7 @@ class ISTFT_Process(torch.nn.Module):
         normalized=NORMALIZED,
         max_frames=MAX_FRAMES,
         center=CENTER,
+        factorized=True,
     ):
         super(ISTFT_Process, self).__init__()
         self.n_fft = n_fft
@@ -96,6 +98,36 @@ class ISTFT_Process(torch.nn.Module):
             )
 
         # ISTFT forward pass preparation
+        self.radix = math.isqrt(n_fft)
+        self.factorized = factorized
+        if factorized and self.radix * self.radix != n_fft:
+            raise NotImplementedError(
+                "Factorized ISTFT requires n_fft to be a perfect square."
+            )
+
+        # Calculate window sum for overlap-add
+        n = n_fft + hop_len * (max_frames - 1)
+        window_sum = torch.zeros(n, dtype=torch.float32)
+        win_sq = window**2
+
+        # Calculate overlap-add weights
+        for i in range(max_frames):
+            sample = i * hop_len
+            window_sum[sample: min(n, sample + n_fft)] += win_sq[
+                : max(0, min(n_fft, n - sample))
+            ]
+
+        self.register_buffer(
+            "window_sum_inv", 1.0 / torch.clamp(window_sum, min=1e-8)
+        )  # Clamp to avoid division by zero
+
+        if factorized:
+            self._init_factorized(window)
+        else:
+            self._init_dense(window)
+
+    def _init_dense(self, window):
+        n_fft = self.n_fft
         time_steps = torch.arange(n_fft, dtype=torch.float32).unsqueeze(1)
         frequencies = torch.arange(self.half_n_fft + 1, dtype=torch.float32).unsqueeze(
             0
@@ -112,37 +144,93 @@ class ISTFT_Process(torch.nn.Module):
         sin_inverse = (-torch.sin(omega) * scale.unsqueeze(0) * window.unsqueeze(1)).T
         inverse_basis = torch.cat([cos_inverse, sin_inverse], dim=0)
 
-        # Calculate window sum for overlap-add
-        n = n_fft + hop_len * (max_frames - 1)
-        window_sum = torch.zeros(n, dtype=torch.float32)
-        win_sq = window**2
-
-        # Calculate overlap-add weights
-        for i in range(max_frames):
-            sample = i * hop_len
-            window_sum[sample: min(n, sample + n_fft)] += win_sq[
-                : max(0, min(n_fft, n - sample))
-            ]
-
         # Normalize window if needed
-        if normalized:
+        if self.normalized:
             inverse_basis = inverse_basis * torch.sqrt(
                 torch.tensor([n_fft], dtype=torch.float32)
             )
 
-        # Register buffers
         self.register_buffer("inverse_basis", inverse_basis)
+
+    def _init_factorized(self, window):
+        """Two-stage inverse DFT, n_fft = R * R, n = R*n1 + n2, k = k1 + R*k2.
+
+        y[n1,n2] = Re sum_k1 W_R^(-k1*n1) * W_N^(-k1*n2) * sum_k2 Z[k1,k2] * W_R^(-k2*n2)
+        Equivalent to the dense inverse basis, with ~16x fewer MACs and R x R sized
+        constant matrices.
+        """
+        R = self.radix
+        N = self.n_fft
+        n_freqs = self.half_n_fft + 1
+        k2_count = -(-n_freqs // R)
+        self.k2_count = k2_count
+        self.n_freqs = n_freqs
+        two_pi = 2.0 * math.pi
+        r = torch.arange(R, dtype=torch.float64)
+        k2 = torch.arange(k2_count, dtype=torch.float64)
+
+        # Interior bins appear twice in the full spectrum; padding bins are zeroed
+        scale = torch.zeros(k2_count * R, dtype=torch.float64)
+        scale[:n_freqs] = 2.0
+        scale[0] = 1.0
+        scale[n_freqs - 1] = 1.0
+        self.register_buffer("bin_scale", (scale / N).float())
+
+        # Stage A: input [Zr | Zi] over k2, output [Br | Bi] over n2
+        angA = two_pi * torch.outer(k2, r) / R
+        cA, sA = torch.cos(angA), torch.sin(angA)
+        stageA = torch.cat(
+            [torch.cat([cA, sA], dim=1), torch.cat([-sA, cA], dim=1)], dim=0
+        )
+        self.register_buffer("stageA", stageA.float())
+
+        # Twiddle W_N^(-k1*n2), layout [k1, n2]
+        angT = two_pi * torch.outer(r, r) / N
+        self.register_buffer("twiddle_re", torch.cos(angT).float())
+        self.register_buffer("twiddle_im", torch.sin(angT).float())
+
+        # Stage C: input [Cr | Ci] over k1, output real signal over n1
+        angC = two_pi * torch.outer(r, r) / R
         self.register_buffer(
-            "window_sum_inv", 1.0 / torch.clamp(window_sum, min=1e-8)
-        )  # Clamp to avoid division by zero
+            "stageC", torch.cat([torch.cos(angC), -torch.sin(angC)], dim=0).float()
+        )
+
+        # Synthesis window (and normalization) in [n1, n2] layout
+        scale_w = math.sqrt(N) if self.normalized else 1.0
+        self.register_buffer(
+            "window_scaled", (window.double() * scale_w).float().reshape(R, R)
+        )
+
+    def _inverse_frames_factorized(self, real, imag):
+        R = self.radix
+        pad = self.k2_count * R - self.n_freqs
+        pad_fn = torch.nn.functional.pad
+        zr = pad_fn(real.transpose(-1, -2), (0, pad)) * self.bin_scale
+        zi = pad_fn(imag.transpose(-1, -2), (0, pad)) * self.bin_scale
+        lead = zr.shape[:-1]
+        # bin k = k1 + R*k2 -> [.., k1, k2]
+        zr = zr.reshape(*lead, self.k2_count, R).transpose(-1, -2)
+        zi = zi.reshape(*lead, self.k2_count, R).transpose(-1, -2)
+        b = torch.matmul(torch.cat([zr, zi], dim=-1), self.stageA)  # [.., k1, 2*n2]
+        br, bi = b[..., :R], b[..., R:]
+        cr = br * self.twiddle_re - bi * self.twiddle_im
+        ci = br * self.twiddle_im + bi * self.twiddle_re
+        c = torch.cat([cr.transpose(-1, -2), ci.transpose(-1, -2)], dim=-1)
+        y = torch.matmul(c, self.stageC)  # [.., n2, n1]
+        y = y.transpose(-1, -2) * self.window_scaled  # [.., n1, n2]
+        return y.reshape(*lead, self.n_fft)
 
     def forward(self, real, imag, length=None):
-        # Prepare input for matrix multiplication: [batch, frames, 2 * n_freqs]
-        complex_input = torch.cat((real, imag), dim=1).transpose(-1, -2)
+        batch_size = real.shape[0]
+        if self.factorized:
+            # [batch, frames, n_fft]
+            inverse_frames = self._inverse_frames_factorized(real, imag)
+        else:
+            # Prepare input for matrix multiplication: [batch, frames, 2 * n_freqs]
+            complex_input = torch.cat((real, imag), dim=1).transpose(-1, -2)
 
-        # Perform matrix multiplication: [batch, frames, n_fft]
-        batch_size = complex_input.shape[0]
-        inverse_frames = torch.matmul(complex_input, self.inverse_basis)
+            # Perform matrix multiplication: [batch, frames, n_fft]
+            inverse_frames = torch.matmul(complex_input, self.inverse_basis)
 
         # Overlap-add without fold: add `overlap` shifted, non-overlapping reshape passes
         num_frames = inverse_frames.shape[1]

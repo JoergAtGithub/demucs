@@ -6,14 +6,28 @@ import argparse
 from pathlib import Path
 from demucs.pretrained import get_model
 from demucs.htdemucs import HTDemucs
+from demucs import spec as demucs_spec
+from demucs.stft import STFT_Process
+from demucs.istft import ISTFT_Process
 
 DEMUCS_MODEL = "htdemucs"
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Convert Demucs PyTorch models to ONNX')
     parser.add_argument("dest_dir", type=str, help="destination path for the converted model")
+    parser.add_argument(
+        "--dft",
+        choices=["factorized", "dense"],
+        default="factorized",
+        help="STFT/ISTFT implementation: factorized (two small 64x64 matrix stages, ~16x fewer MACs, "
+        "small constants) or dense (one 4096x4098 matrix).",
+    )
 
     args = parser.parse_args()
+
+    if args.dft == "dense":
+        demucs_spec.demucs_stft = STFT_Process(factorized=False)
+        demucs_spec.demucs_istft = ISTFT_Process(factorized=False)
 
     dir_out = Path(args.dest_dir)
     dir_out.mkdir(parents=True, exist_ok=True)
