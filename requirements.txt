@@ -18,6 +18,7 @@ pyyaml
 submitit
 torch>=2.1.2
 torchaudio>=2.1.2
+torchvision
 tqdm
 treetable
 soundfile>=0.10.3

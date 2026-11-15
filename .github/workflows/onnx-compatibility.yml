@@ -1,0 +1,336 @@
+name: ONNX Cross-Platform & EP Compatibility
+
+on:
+  push:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  # =====================================================================
+  # JOB 1: Build the ONNX model once & upload it as an artifact
+  # =====================================================================
+  build-onnx-model:
+    name: Build htdemucs.onnx
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install Export Dependencies
+        run: |
+          START=$(date +%s.%N)
+          pip install --upgrade pip
+          pip install torch torchaudio onnx onnxscript
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          END=$(date +%s.%N)
+          echo "⏱️ Dependencies installed in: $(python -c "print(f'{${END} - ${START}:.2f}s')")"
+
+      - name: Convert PyTorch to ONNX
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          START=$(date +%s.%N)
+          mkdir -p ./onnx-models
+          python ./scripts/convert-pth-to-onnx.py ./onnx-models
+          END=$(date +%s.%N)
+          echo "⏱️ Model conversion took: $(python -c "print(f'{${END} - ${START}:.2f}s')")"
+
+      - name: Validate ONNX Structure & Shapes
+        run: |
+          python -c "
+          import time, onnx
+          t0 = time.perf_counter()
+          model = onnx.load('./onnx-models/htdemucs.onnx')
+          onnx.checker.check_model(model)
+          print(f'✅ ONNX graph is valid! Duration: {time.perf_counter() - t0:.3f}s')
+          "
+
+      - name: Upload ONNX Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: htdemucs.onnx
+          path: ./onnx-models/htdemucs.onnx
+          retention-days: 1
+          archive: false
+
+  # =====================================================================
+  # JOB 2: Multi-OS & Execution Provider Sequential Test Matrix
+  # =====================================================================
+  test-execution-providers:
+    name: Test (${{ matrix.target_name }})
+    needs: build-onnx-model
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # --- Linux x64: OpenVINO (CPU -> GPU -> All Intel NPUs) ---
+          - target_name: "Linux x64 - OpenVINO (CPU -> GPU -> NPUs)"
+            os: ubuntu-latest
+            pkg: "onnxruntime>=1.24.1 onnxruntime-ep-openvino openvino==2026.3.1"
+            targets: |
+              [
+                {"name": "ORT CPU", "ep": "CPUExecutionProvider"},
+                {"name": "OpenVINO CPU (Plugin EP)", "ep": "OpenVINOExecutionProvider", "options": {"device_type": "CPU"}, "plugin_ep": true},
+                {"name": "OpenVINO GPU", "ep": "OpenVINOExecutionProvider", "options": {"device_type": "GPU"}, "force_offline": true},
+                {"name": "NPU 3720 (Meteor/Arrow Lake)", "ep": "OpenVINOExecutionProvider", "npu_platform": "3720", "compile_only": true},
+                {"name": "NPU 4000 (Lunar Lake)", "ep": "OpenVINOExecutionProvider", "npu_platform": "4000", "compile_only": true},
+                {"name": "NPU 5010 (Panther Lake)", "ep": "OpenVINOExecutionProvider", "npu_platform": "5010", "compile_only": true},
+                {"name": "NPU 5020 (Wildcat Lake)", "ep": "OpenVINOExecutionProvider", "npu_platform": "5020", "compile_only": true, "optional_platform": true},
+                {"name": "NPU 6010 (Nova Lake)", "ep": "OpenVINOExecutionProvider", "npu_platform": "6010", "compile_only": true, "optional_platform": true}
+              ]
+
+          # --- Linux x64: NVIDIA CUDA + cuDNN + TensorRT ---
+          - target_name: "Linux x64 - NVIDIA CUDA, cuDNN & TensorRT"
+            os: ubuntu-latest
+            install_nvidia_driver: true
+            pkg: "'onnxruntime-gpu[cuda,cudnn]' nvidia-cublas tensorrt-cu13"
+            targets: |
+              [
+                {"name": "ORT CPU (CUDA Build)", "ep": "CPUExecutionProvider"},
+                {"name": "NVIDIA CUDA + cuDNN", "ep": "CUDAExecutionProvider", "options": {"cudnn_conv_algo_search": "EXHAUSTIVE"}, "allow_no_gpu_dry_run": true}
+              ]
+
+          # --- Linux ARM64: CPU -> XNNPACK ---
+          - target_name: "Linux ARM64 - CPU -> XNNPACK"
+            os: ubuntu-24.04-arm
+            pkg: ""
+            build_ort_xnnpack: true
+            targets: |
+              [
+                {"name": "ORT CPU", "ep": "CPUExecutionProvider"},
+                {"name": "XNNPACK (ARM NEON)", "ep": "XnnpackExecutionProvider"}
+              ]
+
+          # --- Windows 11 x64: OpenVINO (CPU -> GPU -> All Intel NPUs) ---
+          - target_name: "Windows x64 - OpenVINO (CPU -> GPU -> NPUs)"
+            os: windows-latest
+            pkg: "onnxruntime-openvino==1.24.1 openvino==2025.4.1"
+            targets: |
+              [
+                {"name": "ORT CPU", "ep": "CPUExecutionProvider"},
+                {"name": "OpenVINO CPU", "ep": "OpenVINOExecutionProvider", "options": {"device_type": "CPU"}},
+                {"name": "OpenVINO GPU", "ep": "OpenVINOExecutionProvider", "options": {"device_type": "GPU"}, "skip_if_missing_hw": true},
+                {"name": "NPU 3720 (Meteor/Arrow Lake)", "ep": "OpenVINOExecutionProvider", "npu_platform": "3720", "compile_only": true},
+                {"name": "NPU 4000 (Lunar Lake)", "ep": "OpenVINOExecutionProvider", "npu_platform": "4000", "compile_only": true},
+                {"name": "NPU 5010 (Panther Lake)", "ep": "OpenVINOExecutionProvider", "npu_platform": "5010", "compile_only": true},
+                {"name": "NPU 5020 (Wildcat Lake)", "ep": "OpenVINOExecutionProvider", "npu_platform": "5020", "compile_only": true, "optional_platform": true},
+                {"name": "NPU 6010 (Nova Lake)", "ep": "OpenVINOExecutionProvider", "npu_platform": "6010", "compile_only": true, "optional_platform": true}
+              ]
+
+          # --- Windows 11 x64: NVIDIA CUDA + cuDNN + TensorRT ---
+          - target_name: "Windows x64 - NVIDIA CUDA, cuDNN & TensorRT"
+            os: windows-latest
+            pkg: "'onnxruntime-gpu[cuda,cudnn]' nvidia-cublas tensorrt-cu13"
+            targets: |
+              [
+                {"name": "ORT CPU (CUDA Build)", "ep": "CPUExecutionProvider"},
+                {"name": "NVIDIA CUDA + cuDNN", "ep": "CUDAExecutionProvider", "options": {"cudnn_conv_algo_search": "EXHAUSTIVE"}, "allow_no_gpu_dry_run": true}
+              ]
+
+          # --- Windows 11 x64: DirectML (CPU -> GPU/WARP) ---
+          - target_name: "Windows x64 - DirectML (CPU -> GPU)"
+            os: windows-latest
+            pkg: "onnxruntime-directml"
+            targets: |
+              [
+                {"name": "ORT CPU", "ep": "CPUExecutionProvider"},
+                {"name": "DirectML (Offline Check)", "ep": "DmlExecutionProvider", "backend": "directml_offline"}
+              ]
+
+          # --- macOS Apple Silicon: CoreML (CPU -> GPU -> ALL/ANE) ---
+          - target_name: "macOS Apple Silicon - CoreML (CPU -> GPU -> NPU)"
+            os: macos-latest
+            pkg: "onnxruntime"
+            allow_skip: false
+            targets: |
+              [
+                {"name": "ORT CPU", "ep": "CPUExecutionProvider"},
+                {"name": "CoreML CPUOnly", "ep": "CoreMLExecutionProvider", "options": {"ModelFormat": "MLProgram", "MLComputeUnits": "CPUOnly"}},
+                {"name": "CoreML CPUAndGPU", "ep": "CoreMLExecutionProvider", "options": {"ModelFormat": "MLProgram", "MLComputeUnits": "CPUAndGPU"}},
+                {"name": "CoreML CPUAndNeuralEngine (NPU)", "ep": "CoreMLExecutionProvider", "options": {"ModelFormat": "MLProgram", "MLComputeUnits": "CPUAndNeuralEngine"}},
+                {"name": "CoreML ALL (GPU+NPU)", "ep": "CoreMLExecutionProvider", "options": {"ModelFormat": "MLProgram", "MLComputeUnits": "ALL"}}
+              ]
+
+          # --- macOS Intel x64: CoreML (CPU -> GPU) ---
+          - target_name: "macOS x64 - CoreML (CPU -> GPU)"
+            os: macos-15-intel
+            pkg: "onnxruntime"
+            targets: |
+              [
+                {"name": "ORT CPU", "ep": "CPUExecutionProvider"},
+                {"name": "CoreML CPUOnly", "ep": "CoreMLExecutionProvider", "options": {"ModelFormat": "MLProgram", "MLComputeUnits": "CPUOnly"}},
+                {"name": "CoreML CPUAndGPU", "ep": "CoreMLExecutionProvider", "options": {"ModelFormat": "MLProgram", "MLComputeUnits": "CPUAndGPU"}}
+              ]
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v5
+
+      - name: Download ONNX Model
+        uses: actions/download-artifact@v8
+        with:
+          name: htdemucs.onnx
+          path: ./onnx-models
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install Intel Linux NPU Userspace Compiler & Level Zero
+        if: runner.os == 'Linux' && contains(matrix.pkg, 'openvino')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          mkdir -p /tmp/npu_driver && cd /tmp/npu_driver
+
+          # 1. Install runtime dependency (TBB) and detect the Ubuntu release (24.04 / 26.04)
+          sudo apt-get update
+          sudo apt-get install -y libtbb12
+          UBUNTU_VER=$(lsb_release -rs)
+          UBUNTU_TAG=${UBUNTU_VER//./}
+          echo "Ubuntu $UBUNTU_VER -> asset suffix ubuntu${UBUNTU_TAG}"
+
+          # 2. Download and extract the latest Intel Linux NPU Driver release (contains the NPU compiler .debs)
+          echo "Release assets of intel/linux-npu-driver:"
+          gh release view --repo intel/linux-npu-driver --json tagName,assets --jq '.tagName, (.assets[].name)'
+          gh release download --repo intel/linux-npu-driver --pattern "*ubuntu${UBUNTU_TAG}.tar.gz"
+          ls -la /tmp/npu_driver
+          tar -xf linux-npu-driver-*.tar.gz
+          echo "Extracted packages:"
+          ls -la *.deb
+          for deb in *compiler*.deb; do echo "== $deb"; dpkg-deb -c "$deb" | grep -E 'libnpu_(mlir|driver)_compiler' || true; done
+
+          # 3. Install Userspace Compiler & Level Zero NPU packages (no kernel module needed for AOT)
+          sudo dpkg -i intel-driver-compiler-npu_*.deb intel-level-zero-npu_*.deb
+
+          # 4. Install the matching Level Zero loader (libze1) from the Intel graphics PPA snapshot
+          wget -q "https://snapshot.ppa.launchpadcontent.net/kobuk-team/intel-graphics/ubuntu/20260830T100000Z/pool/main/l/level-zero-loader/libze1_1.32.0-1~${UBUNTU_VER}~ppa1_amd64.deb"
+          sudo dpkg -i libze1_*.deb
+          sudo ldconfig
+
+      - name: Install NVIDIA Driver Libraries
+        if: matrix.install_nvidia_driver
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libnvidia-compute-580 || sudo apt-get install -y --no-install-recommends libnvidia-compute-570 || sudo apt-get install -y --no-install-recommends libnvidia-compute-550
+          sudo ldconfig
+          ldconfig -p | grep libcuda || true
+
+      - name: Cache ONNX Runtime XNNPACK wheel
+        if: matrix.build_ort_xnnpack
+        id: ort-xnnpack-cache
+        uses: actions/cache@v4
+        with:
+          path: ort-xnnpack-wheel
+          key: ort-xnnpack-wheel-${{ runner.os }}-${{ runner.arch }}-v1.24.1-py3.11
+
+      - name: Build ONNX Runtime with XNNPACK
+        if: matrix.build_ort_xnnpack && steps.ort-xnnpack-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip numpy wheel packaging setuptools cmake
+          git clone --depth 1 --branch v1.24.1 --recursive https://github.com/microsoft/onnxruntime.git ort-src
+          cd ort-src
+          ./build.sh --config Release --use_xnnpack --build_wheel --parallel --skip_tests --compile_no_warning_as_error --cmake_extra_defines CMAKE_POLICY_VERSION_MINIMUM=3.5
+          mkdir -p ../ort-xnnpack-wheel
+          cp build/Linux/Release/dist/*.whl ../ort-xnnpack-wheel/
+
+      - name: Install ONNX Runtime XNNPACK wheel
+        if: matrix.build_ort_xnnpack
+        shell: bash
+        run: pip install ort-xnnpack-wheel/*.whl
+
+      - name: Install Runtime Package (${{ matrix.pkg }})
+        shell: bash
+        run: |
+          START=$(python -c "import time; print(time.perf_counter())")
+          python -m pip install --upgrade pip
+          if [[ "${{ matrix.pkg }}" == *openvino* ]]; then
+            pip install numpy onnx
+          else
+            pip install numpy onnx colored polygraphy --extra-index-url https://pypi.ngc.nvidia.com
+          fi
+          if [ -n "${{ matrix.pkg }}" ]; then pip install ${{ matrix.pkg }}; fi
+          python -c "import time; print(f'⏱️ Runtime package installed in {time.perf_counter() - ${START}:.2f}s')"
+
+      - name: Link Intel NPU Compiler into OpenVINO libs
+        if: runner.os == 'Linux' && contains(matrix.pkg, 'openvino')
+        shell: bash
+        run: |
+          OV_LIBS=$(python -c "import openvino, os; print(os.path.join(os.path.dirname(openvino.__file__), 'libs'))")
+          echo "OpenVINO libs: $OV_LIBS"
+          for lib in libnpu_mlir_compiler.so libnpu_driver_compiler.so; do
+            SRC=$(find /usr/lib /usr/local/lib -name "$lib*" 2>/dev/null | head -n 1)
+            if [ -n "$SRC" ]; then
+              sudo ln -sf "$SRC" "$OV_LIBS/$lib"
+              echo "Linked $SRC -> $OV_LIBS/$lib"
+            else
+              echo "::warning::$lib not found on system (NPU AOT compilation may fail)"
+            fi
+          done
+          echo "LD_LIBRARY_PATH=$OV_LIBS:$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+
+      - name: Run Execution Provider Sequence
+        shell: bash
+        env:
+          TEST_TARGETS: ${{ matrix.targets }}
+        run: |
+          python ./scripts/test_onnx_ep.py ./onnx-models/htdemucs.onnx
+
+  # =====================================================================
+  # JOB 3: Offline Cross-Compilation for Multiple AMD GPU Architectures
+  # =====================================================================
+  test-migraphx-offline:
+    name: Test (Linux x64 - AMD MIGraphX Multi-Arch AOT)
+    needs: build-onnx-model
+    runs-on: ubuntu-latest
+    container:
+      image: rocm/dev-ubuntu-24.04:latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v5
+
+      - name: Download ONNX Model
+        uses: actions/download-artifact@v8
+        with:
+          name: htdemucs.onnx
+          path: ./onnx-models
+
+      - name: Install MIGraphX and Python Helpers in Container
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl gnupg python3-pip
+          mkdir -p /etc/apt/keyrings
+          curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor -o /etc/apt/keyrings/rocm.gpg
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/latest noble main" > /etc/apt/sources.list.d/rocm-classic.list
+          apt-get update
+          apt-get install -y --no-install-recommends migraphx
+          dpkg -L migraphx | grep -i 'bin/' || true
+          python3 -m pip install --break-system-packages numpy onnx colored polygraphy onnxruntime --extra-index-url https://pypi.ngc.nvidia.com
+          echo "$(dirname "$(ls /opt/rocm*/bin/migraphx-driver | tail -n 1)")" >> "$GITHUB_PATH"
+
+      - name: Cross-Compile ONNX Graph for AMD GPU Architectures
+        env:
+          TEST_TARGETS: |
+            [
+              {"name": "AMD RDNA 2 (gfx1030 - RX 6000)", "backend": "migraphx_cli", "gfx_arch": "gfx1030"},
+              {"name": "AMD RDNA 3 (gfx1100 - RX 7000)", "backend": "migraphx_cli", "gfx_arch": "gfx1100"},
+              {"name": "AMD RDNA 3.5 (gfx1150 - Ryzen AI)", "backend": "migraphx_cli", "gfx_arch": "gfx1150", "optional_arch": true},
+              {"name": "AMD RDNA 4 (gfx1201 - RX 9000)", "backend": "migraphx_cli", "gfx_arch": "gfx1201", "optional_arch": true},
+              {"name": "AMD CDNA 2 (gfx90a - MI200)", "backend": "migraphx_cli", "gfx_arch": "gfx90a"}
+            ]
+        run: |
+          python3 ./scripts/test_onnx_ep.py ./onnx-models/htdemucs.onnx
