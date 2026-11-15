@@ -65,7 +65,6 @@ class ISTFT_Process(torch.nn.Module):
         normalized=NORMALIZED,
         max_frames=MAX_FRAMES,
         center=CENTER,
-        factorized=True,
     ):
         super(ISTFT_Process, self).__init__()
         self.n_fft = n_fft
@@ -99,10 +98,9 @@ class ISTFT_Process(torch.nn.Module):
 
         # ISTFT forward pass preparation
         self.radix = math.isqrt(n_fft)
-        self.factorized = factorized
-        if factorized and self.radix * self.radix != n_fft:
+        if self.radix * self.radix != n_fft:
             raise NotImplementedError(
-                "Factorized ISTFT requires n_fft to be a perfect square."
+                "ISTFT requires n_fft to be a perfect square."
             )
 
         # Calculate window sum for overlap-add
@@ -121,42 +119,13 @@ class ISTFT_Process(torch.nn.Module):
             "window_sum_inv", 1.0 / torch.clamp(window_sum, min=1e-8)
         )  # Clamp to avoid division by zero
 
-        if factorized:
-            self._init_factorized(window)
-        else:
-            self._init_dense(window)
-
-    def _init_dense(self, window):
-        n_fft = self.n_fft
-        time_steps = torch.arange(n_fft, dtype=torch.float32).unsqueeze(1)
-        frequencies = torch.arange(self.half_n_fft + 1, dtype=torch.float32).unsqueeze(
-            0
-        )
-        omega = 2 * torch.pi * ((time_steps * frequencies) % n_fft) / n_fft
-
-        # Bins between DC and Nyquist appear twice in the full spectrum
-        scale = torch.ones(self.half_n_fft + 1)
-        scale[1:-1] = 2.0
-        scale = scale / n_fft
-
-        # Create inverse basis (window applied) of shape [2 * n_freqs, n_fft]
-        cos_inverse = (torch.cos(omega) * scale.unsqueeze(0) * window.unsqueeze(1)).T
-        sin_inverse = (-torch.sin(omega) * scale.unsqueeze(0) * window.unsqueeze(1)).T
-        inverse_basis = torch.cat([cos_inverse, sin_inverse], dim=0)
-
-        # Normalize window if needed
-        if self.normalized:
-            inverse_basis = inverse_basis * torch.sqrt(
-                torch.tensor([n_fft], dtype=torch.float32)
-            )
-
-        self.register_buffer("inverse_basis", inverse_basis)
+        self._init_factorized(window)
 
     def _init_factorized(self, window):
         """Two-stage inverse DFT, n_fft = R * R, n = R*n1 + n2, k = k1 + R*k2.
 
         y[n1,n2] = Re sum_k1 W_R^(-k1*n1) * W_N^(-k1*n2) * sum_k2 Z[k1,k2] * W_R^(-k2*n2)
-        Equivalent to the dense inverse basis, with ~16x fewer MACs and R x R sized
+        Equivalent to a dense inverse DFT basis, with ~16x fewer MACs and R x R sized
         constant matrices.
         """
         R = self.radix
@@ -237,20 +206,8 @@ class ISTFT_Process(torch.nn.Module):
         """real/imag: [batch, freqs, frames]. Missing high bins are treated as zero and
         `zero_frames` all-zero frames are implicitly present on each side."""
         batch_size = real.shape[0]
-        if self.factorized:
-            # [batch, frames, n_fft]
-            inverse_frames = self._inverse_frames_factorized(real, imag)
-        else:
-            n_freqs = self.half_n_fft + 1
-            missing = n_freqs - real.shape[1]
-            if missing > 0:
-                real = torch.nn.functional.pad(real, (0, 0, 0, missing))
-                imag = torch.nn.functional.pad(imag, (0, 0, 0, missing))
-            # Prepare input for matrix multiplication: [batch, frames, 2 * n_freqs]
-            complex_input = torch.cat((real, imag), dim=1).transpose(-1, -2)
-
-            # Perform matrix multiplication: [batch, frames, n_fft]
-            inverse_frames = torch.matmul(complex_input, self.inverse_basis)
+        # [batch, frames, n_fft]
+        inverse_frames = self._inverse_frames_factorized(real, imag)
 
         # Overlap-add as one Conv2d: chunk j of the output is the sum over o of
         # chunk o of frame (j - o). The shifts are conv padding (no Pad op).

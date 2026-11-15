@@ -79,7 +79,6 @@ class STFT_Process(torch.nn.Module):
         normalized=NORMALIZED,
         center=CENTER,
         pad_mode=PAD_MODE,
-        factorized=True,
     ):
         super(STFT_Process, self).__init__()
         self.n_fft = n_fft
@@ -100,39 +99,9 @@ class STFT_Process(torch.nn.Module):
         window = WindowType(window_type)(self.window_length).float()
 
         self.radix = math.isqrt(n_fft)
-        self.factorized = factorized
-        if factorized:
-            if self.radix * self.radix != n_fft:
-                raise NotImplementedError("Factorized STFT requires n_fft to be a perfect square.")
-            self._init_factorized(window)
-            self._frame_idx_cache = {}
-            return
-
-        # STFT forward pass preparation
-        time_steps = torch.arange(self.n_fft, dtype=torch.float32).unsqueeze(0)
-        frequencies = torch.arange(self.half_n_fft + 1, dtype=torch.float32).unsqueeze(
-            1
-        )
-
-        # Calculate omega matrix once
-        omega = 2 * torch.pi * frequencies * time_steps / n_fft
-
-        # Calculate window function
-        cos_kernel = (torch.cos(omega) * window.unsqueeze(0)).unsqueeze(1)
-        sin_kernel = (-torch.sin(omega) * window.unsqueeze(0)).unsqueeze(1)
-
-        # Normalize window if needed
-        if normalized:
-            cos_kernel = cos_kernel / torch.sqrt(
-                torch.tensor([n_fft], dtype=torch.float32)
-            )
-            sin_kernel = sin_kernel / torch.sqrt(
-                torch.tensor([n_fft], dtype=torch.float32)
-            )
-
-        # Register the DFT matrix [n_fft, 2 * n_freqs] as buffer (cos part, then sin part)
-        dft_matrix = torch.cat([cos_kernel.squeeze(1).T, sin_kernel.squeeze(1).T], dim=1)
-        self.register_buffer("dft_matrix", dft_matrix)
+        if self.radix * self.radix != n_fft:
+            raise NotImplementedError("STFT requires n_fft to be a perfect square.")
+        self._init_factorized(window)
         self._frame_idx_cache = {}
 
     def _init_factorized(self, window):
@@ -221,19 +190,9 @@ class STFT_Process(torch.nn.Module):
         frames = torch.index_select(x_padded, dim=-1, index=frame_indices)
         frames = frames.reshape(batch_size, num_channels, num_frames, self.n_fft)
 
-        if self.factorized:
-            xr, xi = self._forward_factorized(frames)
-            real_part = xr.transpose(-1, -2).squeeze(1)
-            image_part = xi.transpose(-1, -2).squeeze(1)
-            return torch.stack((real_part, image_part), dim=-1)
-
-        # Perform matrix multiplication with the DFT matrix
-        spec = torch.matmul(frames, self.dft_matrix)
-        n_freqs = self.half_n_fft + 1
-        real_part = spec[..., :n_freqs].transpose(-1, -2).squeeze(1)
-        image_part = spec[..., n_freqs:].transpose(-1, -2).squeeze(1)
-
-        # return real_part, image_part
+        xr, xi = self._forward_factorized(frames)
+        real_part = xr.transpose(-1, -2).squeeze(1)
+        image_part = xi.transpose(-1, -2).squeeze(1)
         return torch.stack((real_part, image_part), dim=-1)
 
 
