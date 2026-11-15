@@ -435,7 +435,11 @@ class HTDemucs(nn.Module):
         assert hl == nfft // 4
         le = int(math.ceil(x.shape[-1] / hl))
         pad = hl // 2 * 3
-        x = pad1d(x, (pad, pad + le * hl - x.shape[-1]), mode="reflect")
+        if self.onnx_exportable:
+            from .stft import reflect_pad_gather
+            x = reflect_pad_gather(x, pad, pad + le * hl - x.shape[-1])
+        else:
+            x = pad1d(x, (pad, pad + le * hl - x.shape[-1]), mode="reflect")
 
         if self.onnx_exportable:
             z = spectro(x, nfft, hl, onnx_exportable=True)[

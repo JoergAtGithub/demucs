@@ -235,11 +235,7 @@ class ISTFT_Process(torch.nn.Module):
         # Overlap-add without fold: add `overlap` shifted, non-overlapping reshape passes
         num_frames = inverse_frames.shape[1]
         output_len = (num_frames - 1) * self.hop_len + self.n_fft
-        inverse_transform = torch.zeros(
-            (batch_size, output_len),
-            dtype=inverse_frames.dtype,
-            device=inverse_frames.device,
-        )
+        inverse_transform = None
         for offset in range(self.overlap):
             sub_frames = inverse_frames[:, offset:: self.overlap, :]
             num_sub_frames = sub_frames.shape[1]
@@ -247,7 +243,10 @@ class ISTFT_Process(torch.nn.Module):
                 flat = sub_frames.reshape(batch_size, num_sub_frames * self.n_fft)
                 start = offset * self.hop_len
                 end = start + num_sub_frames * self.n_fft
-                inverse_transform[:, start:end] = inverse_transform[:, start:end] + flat
+                placed = torch.nn.functional.pad(flat, (start, output_len - end))
+                inverse_transform = (
+                    placed if inverse_transform is None else inverse_transform + placed
+                )
 
         # Apply window correction
         start_idx = self.half_n_fft
@@ -260,20 +259,9 @@ class ISTFT_Process(torch.nn.Module):
 
         # If length is specified, trim the output to the desired length
         if length:
-            pad_len = torch.clamp(torch.tensor(length) - output.size(-1), min=0)
-
-            # Create a zero pad tensor regardless of need
-            pad = torch.zeros(
-                output.size(0),
-                pad_len,
-                dtype=output.dtype,
-                device=output.device,
-            )
-
-            # Always cat, pad_len will be 0 if not needed
-            output = torch.cat([output, pad], dim=-1)
-
-            # Crop in all cases to enforce exact length
+            pad_len = max(int(length) - int(output.size(-1)), 0)
+            if pad_len > 0:
+                output = torch.nn.functional.pad(output, (0, pad_len))
             output = output[..., :length]
 
         return output

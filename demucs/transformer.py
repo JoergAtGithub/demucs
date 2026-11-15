@@ -13,12 +13,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import math
+import functools
 from einops import rearrange
 
 
 def create_sin_embedding(
     length: int, dim: int, shift: int = 0, device="cpu", max_period=10000
 ):
+    return _create_sin_embedding_cached(
+        int(length), int(dim), int(shift), max_period
+    ).to(device)
+
+
+@functools.lru_cache(maxsize=8)
+def _create_sin_embedding_cached(length, dim, shift, max_period, device="cpu"):
     # We aim for TBC format
     assert dim % 2 == 0
     pos = shift + torch.arange(length, device=device).view(-1, 1, 1)
@@ -35,6 +43,13 @@ def create_sin_embedding(
 
 
 def create_2d_sin_embedding(d_model, height, width, device="cpu", max_period=10000):
+    return _create_2d_sin_embedding_cached(
+        int(d_model), int(height), int(width), max_period
+    ).to(device)
+
+
+@functools.lru_cache(maxsize=8)
+def _create_2d_sin_embedding_cached(d_model, height, width, max_period):
     """
     :param d_model: dimension of the model
     :param height: height of the positions
@@ -67,7 +82,7 @@ def create_2d_sin_embedding(d_model, height, width, device="cpu", max_period=100
         torch.cos(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, width)
     )
 
-    return pe[None, :].to(device)
+    return pe[None, :]
 
 
 def create_sin_embedding_cape(

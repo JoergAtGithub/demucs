@@ -53,6 +53,12 @@ if __name__ == '__main__':
     dummy_waveform = F.pad(dummy_waveform, (0, training_length - dummy_waveform.shape[-1]))
     dummy_input = (dummy_waveform)
 
+    # Warm-up run: fills the positional embedding caches so that the export
+    # sees them as constants instead of tracing sin/cos/scatter ops.
+    core_model.eval()
+    with torch.no_grad():
+        core_model(dummy_input)
+
     # Define output file name
     onnx_file_path = dir_out / f"{model_name}.onnx"
     print(f"Converting {model_name} to ONNX format...")
@@ -64,7 +70,7 @@ if __name__ == '__main__':
             dummy_input,
             str(onnx_file_path),
             export_params=True,
-            opset_version=17,
+            opset_version=18,
             do_constant_folding=True,
             input_names=['input'],
             output_names=['output'],

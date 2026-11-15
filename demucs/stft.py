@@ -50,6 +50,25 @@ class WindowType(enum.StrEnum):
                 )
 
 
+_REFLECT_IDX_CACHE = {}
+
+
+def reflect_pad_gather(x, left, right):
+    """Reflect padding of the last dim as one Gather with constant indices
+    (identical to F.pad(mode='reflect'), but avoids the Pad op that NPU
+    compilers decompose into thousands of Slices)."""
+    length = int(x.shape[-1])
+    key = (length, left, right, x.device)
+    if key not in _REFLECT_IDX_CACHE:
+        idx = torch.cat([
+            torch.arange(left, 0, -1),
+            torch.arange(length),
+            torch.arange(length - 2, length - 2 - right, -1),
+        ])
+        _REFLECT_IDX_CACHE[key] = idx.to(x.device)
+    return torch.index_select(x, -1, _REFLECT_IDX_CACHE[key])
+
+
 class STFT_Process(torch.nn.Module):
     def __init__(
         self,
@@ -187,9 +206,12 @@ class STFT_Process(torch.nn.Module):
     def forward(self, x):
         batch_size, num_channels, _ = x.shape
         if self.center:
-            x_padded = torch.nn.functional.pad(
-                x, (self.half_n_fft, self.half_n_fft), mode=self.pad_mode
-            )
+            if self.pad_mode == "reflect":
+                x_padded = reflect_pad_gather(x, self.half_n_fft, self.half_n_fft)
+            else:
+                x_padded = torch.nn.functional.pad(
+                    x, (self.half_n_fft, self.half_n_fft), mode=self.pad_mode
+                )
         else:
             x_padded = x
 
