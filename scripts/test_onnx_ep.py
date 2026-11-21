@@ -1,4 +1,5 @@
 import ctypes
+from contextlib import contextmanager
 import glob
 import json
 import os
@@ -6,15 +7,17 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import numpy as np
 
 import onnx
 
-try:
-    import openvino  # noqa: F401  (must be imported BEFORE onnxruntime on Linux & Windows to prevent libopenvino symbol collisions)
-except ImportError:
-    pass
+if len(sys.argv) < 2 or sys.argv[1] != "--plugin-ep":
+    try:
+        import openvino  # noqa: F401  (must be imported BEFORE onnxruntime on Linux & Windows to prevent libopenvino symbol collisions)
+    except ImportError:
+        pass
 
 import onnxruntime as ort
 
@@ -288,20 +291,87 @@ def diagnose_cpu_fallback(model_path, target_ep, ep_options):
             print(f"     {line.strip()[:200]}")
 
 
-def test_npu_aot_compile(model_path, name, platform):
-    """Run the NPU AOT compile in a child process so the pip openvino libraries never share a process with onnxruntime-openvino."""
-    proc = subprocess.run(
-        [sys.executable, os.path.abspath(__file__), "--npu-aot", model_path, name, str(platform)],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
+@contextmanager
+def report_target_progress(name, interval=30):
+    started = time.monotonic()
+    finished = threading.Event()
+
+    def report():
+        while not finished.wait(interval):
+            elapsed = time.monotonic() - started
+            print(f"⏳ {name}: still running after {elapsed:.0f}s (elapsed time, not compiler progress).", flush=True)
+
+    print(f"▶️ Starting {name}.", flush=True)
+    reporter = threading.Thread(target=report, daemon=True)
+    reporter.start()
+    try:
+        yield
+    finally:
+        finished.set()
+        reporter.join()
+
+
+def report_child_resources(proc, finished, interval=60):
+    while not finished.wait(interval):
+        if proc.poll() is not None:
+            break
+        try:
+            snapshot = subprocess.run(
+                ["ps", "-p", str(proc.pid), "-o", "pid=,stat=,%cpu=,rss=,vsz=,nlwp=,etime=,wchan:32="],
+                capture_output=True, text=True, timeout=5,
+            )
+            print(f"🔎 PID STAT %CPU(avg) RSS(KiB) VSZ(KiB) THREADS ELAPSED WCHAN: {snapshot.stdout.strip() or 'unavailable'}", flush=True)
+        except (OSError, subprocess.SubprocessError) as e:
+            print(f"🔎 Process resource snapshot unavailable: {e}", flush=True)
+        for path in ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.events"):
+            try:
+                with open(path, encoding="utf-8") as source:
+                    value = source.read().strip().replace("\n", ", ")
+                print(f"🔎 {path}: {value}", flush=True)
+            except OSError:
+                pass
+
+
+def run_logged_child(args, name, description, log_resources=False):
+    proc = subprocess.Popen(
+        [sys.executable, "-u", os.path.abspath(__file__), *args],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace", bufsize=1,
     )
-    out = proc.stdout or ""
-    print(out + (proc.stderr or ""), end="")
-    for line in out.splitlines():
-        if line.startswith("RESULT_JSON:"):
-            return json.loads(line[len("RESULT_JSON:"):])
-    msg = f"NPU AOT compile crashed or failed (exit code {proc.returncode})."
+    result = None
+    finished = threading.Event()
+    monitor = None
+    if log_resources and sys.platform.startswith("linux"):
+        monitor = threading.Thread(target=report_child_resources, args=(proc, finished), daemon=True)
+        monitor.start()
+    try:
+        with proc.stdout:
+            for line in proc.stdout:
+                print(line, end="", flush=True)
+                result_line = line.lstrip("\x00")
+                if result_line.startswith("RESULT_JSON:"):
+                    try:
+                        result = json.loads(result_line[len("RESULT_JSON:"):])
+                    except json.JSONDecodeError:
+                        result = None
+        returncode = proc.wait()
+    finally:
+        finished.set()
+        if monitor is not None:
+            monitor.join()
+    if returncode == 0 and isinstance(result, dict):
+        return result
+    msg = f"{description} failed or did not return a valid result (exit code {returncode})."
     print(f"❌ {msg}")
     return {"name": name, "status": "FAILED", "compile_s": 0.0, "warmup_s": 0.0, "infer_s": 0.0, "error": msg}
+
+
+def test_npu_aot_compile(model_path, name, platform, log_level=None, log_resources=False):
+    """Run NPU AOT compilation in an isolated process and stream its output."""
+    args = ["--npu-aot", model_path, name, str(platform)]
+    if log_level:
+        args.append(log_level)
+    return run_logged_child(args, name, "NPU AOT compile", log_resources=log_resources)
 
 
 def _npu_ir_check(ov, model_path, model, name, platform, t0):
@@ -355,11 +425,11 @@ def run_openvino_gpu_offline_check(model_path, name):
         print(f"❌ OpenVINO GPU offline check ERROR: {msg}")
         return {"name": name, "status": "FAILED", "compile_s": time.perf_counter() - t0, "warmup_s": 0.0, "infer_s": 0.0, "error": msg}
     compile_s = round(time.perf_counter() - t0, 3)
-    print(f"✅ OpenVINO GPU plugin & IR serialization PASSED in {compile_s:.3f}s (no GPU hardware on runner).")
+    print(f"✅ OpenVINO GPU plugin & IR serialization PASSED in {compile_s:.3f}s. GPU compilation and loading were not tested.")
     return {"name": name, "status": "PASSED (IR)", "compile_s": compile_s, "warmup_s": 0.0, "infer_s": 0.0, "error": ""}
 
 
-def _npu_aot_compile_impl(model_path, name, platform):
+def _npu_aot_compile_impl(model_path, name, platform, log_level=None):
     import io
     try:
         import openvino as ov
@@ -371,17 +441,26 @@ def _npu_aot_compile_impl(model_path, name, platform):
     try:
         core = ov.Core()
         print(f"ℹ️  OpenVINO {ov.__version__}, devices visible: {core.available_devices}")
+        print(f"⏳ NPU {platform}: reading model.", flush=True)
         model = core.read_model(model_path)
-        config = {"NPU_PLATFORM": str(platform), "NPU_COMPILER_TYPE": "MLIR", "PERFORMANCE_HINT": "LATENCY"}
+        config = {"NPU_PLATFORM": str(platform), "NPU_COMPILER_TYPE": "PLUGIN"}
+        if log_level:
+            config["LOG_LEVEL"] = log_level
+            print(f"🔎 NPU {platform}: compiler log level {log_level}.", flush=True)
         if sys.platform == "win32":
             return _npu_ir_check(ov, model_path, model, name, platform, t0)
         if model.is_dynamic():
+            print(f"⏳ NPU {platform}: resolving dynamic input shapes.", flush=True)
             onnx_inputs = onnx.load(model_path, load_external_data=False).graph.input
             model.reshape({i.name: resolve_shape(i.type.tensor_type.shape) for i in onnx_inputs})
+        print(f"⏳ NPU {platform}: starting compiler-in-plugin.", flush=True)
         compiled = core.compile_model(model, device_name="NPU", config=config)
         t_compile = time.perf_counter() - t0
+        print(f"⏳ NPU {platform}: compilation finished; exporting blob.", flush=True)
         blob = io.BytesIO()
         compiled.export_model(blob)
+        if not blob.getbuffer().nbytes:
+            raise RuntimeError("NPU compiler exported an empty blob.")
         size_mb = len(blob.getvalue()) / (1024 * 1024)
     except Exception as e:
         msg = str(e)
@@ -468,27 +547,43 @@ def run_directml_offline_check(onnx_path, target_name="DirectML (Offline Check)"
 _registered_plugin_eps = set()
 
 
-def create_plugin_ep_session(model_path, sess_options, ep_options):
+def run_plugin_ep_in_subprocess(model_path, target):
+    """Keep the standalone EP's bundled OpenVINO libraries isolated from the Python package."""
+    name = target.get("name", target["ep"])
+    return run_logged_child(["--plugin-ep", model_path, json.dumps(target)], name, "OpenVINO plugin EP process")
+
+
+def create_plugin_ep_session(model_path, sess_options, ep_options, verbose=False):
     """Create a session using the standalone onnxruntime-ep-openvino plugin EP."""
     import onnxruntime_ep_openvino as openvino_ep
-    ep_name = openvino_ep.get_ep_name()
-    if ep_name not in _registered_plugin_eps:
-        ort.register_execution_provider_library("openvino_ep", openvino_ep.get_library_path())
-        _registered_plugin_eps.add(ep_name)
-    options = dict(ep_options)
-    device_type = options.pop("device_type", "CPU")
-    all_devices = ort.get_ep_devices()
-    devices = [
-        d for d in all_devices
-        if d.ep_name.split(".")[0] == ep_name and str(d.ep_metadata.get("ov_device", "")).upper() == device_type.upper()
-    ]
-    devices.sort(key=lambda d: d.ep_name != ep_name)
-    if not devices:
-        print(f"🔍 Registered plugin library: {openvino_ep.get_library_path()}")
-        print(f"🔍 ORT EP devices visible ({len(all_devices)}):")
-        for d in all_devices:
-            print(f"   - {d.ep_name}: ov_device={d.ep_metadata.get('ov_device')}")
-        raise RuntimeError(f"No OpenVINO plugin EP device found for {device_type}.")
+    if verbose:
+        ort.set_default_logger_severity(0)
+        print("🔎 Enabled verbose ONNX Runtime logging for plugin registration.", flush=True)
+    try:
+        ep_name = openvino_ep.get_ep_name()
+        if ep_name not in _registered_plugin_eps:
+            ort.register_execution_provider_library("openvino_ep", openvino_ep.get_library_path())
+            _registered_plugin_eps.add(ep_name)
+        options = dict(ep_options)
+        device_type = options.pop("device_type", "CPU")
+        all_devices = ort.get_ep_devices()
+        devices = [
+            d for d in all_devices
+            if d.ep_name.split(".")[0] == ep_name and str(d.ep_metadata.get("ov_device", "")).upper() == device_type.upper()
+        ]
+        devices.sort(key=lambda d: d.ep_name != ep_name)
+        if not devices:
+            print(f"🔍 Registered plugin library: {openvino_ep.get_library_path()}")
+            print(f"🔍 ORT EP devices visible ({len(all_devices)}):")
+            for d in all_devices:
+                hardware = d.device
+                print(f"   - {d.ep_name}: ep_vendor={d.ep_vendor}, ep_metadata={d.ep_metadata}, "
+                      f"type={hardware.type}, vendor={hardware.vendor}, vendor_id={hardware.vendor_id}, "
+                      f"device_id={hardware.device_id}, metadata={hardware.metadata}")
+            raise RuntimeError(f"No OpenVINO plugin EP device found for {device_type}.")
+    finally:
+        if verbose:
+            ort.set_default_logger_severity(2)
     sess_options.add_provider_for_devices([devices[0]], options)
     return ort.InferenceSession(model_path, sess_options=sess_options)
 
@@ -507,7 +602,11 @@ def run_single_target(model_path, dummy_inputs, target):
         print(f"🎯 Target:              {name}")
         print(f"🧠 Target NPU Platform: {target['npu_platform']} (OpenVINO API AOT compile, no ORT session)")
         print("--------------------------------------------------")
-        return test_npu_aot_compile(model_path, name, target["npu_platform"])
+        return test_npu_aot_compile(
+            model_path, name, target["npu_platform"],
+            log_level=target.get("npu_log_level"),
+            log_resources=target.get("log_resources", False),
+        )
 
     name = target.get("name", target["ep"])
     target_ep = target["ep"]
@@ -522,13 +621,17 @@ def run_single_target(model_path, dummy_inputs, target):
         import importlib.util
         plugin_ep = importlib.util.find_spec("onnxruntime_ep_openvino") is not None
 
+    if (plugin_ep and ep_options.get("device_type", "CPU") == "CPU"
+            and (len(sys.argv) < 2 or sys.argv[1] != "--plugin-ep")):
+        return run_plugin_ep_in_subprocess(model_path, target)
+
     temp_config_path = None
 
     # Dynamically generate OpenVINO NPU AOT config if npu_platform is specified
     if npu_platform:
         ov_config = {
             "NPU": {
-                "NPU_COMPILER_TYPE": "MLIR",
+                "NPU_COMPILER_TYPE": "PLUGIN",
                 "NPU_PLATFORM": str(npu_platform),
             }
         }
@@ -578,7 +681,7 @@ def run_single_target(model_path, dummy_inputs, target):
         t1 = time.perf_counter()
         try:
             if plugin_ep:
-                session = create_plugin_ep_session(model_path, sess_options, ep_options)
+                session = create_plugin_ep_session(model_path, sess_options, ep_options, verbose=target.get("plugin_verbose", False))
             else:
                 providers = [(target_ep, ep_options)] if ep_options else [target_ep]
                 session = ort.InferenceSession(
@@ -804,7 +907,6 @@ def main():
             {"name": "OpenVINO CPU", "ep": "OpenVINOExecutionProvider", "options": {"device_type": "CPU"}},
             {"name": "OpenVINO GPU", "ep": "OpenVINOExecutionProvider", "options": {"device_type": "GPU"}, "skip_if_missing_hw": True},
             {"name": "NPU 3720 (Meteor/Arrow Lake)", "ep": "OpenVINOExecutionProvider", "npu_platform": "3720", "compile_only": True},
-            {"name": "NPU 4000 (Lunar Lake)", "ep": "OpenVINOExecutionProvider", "npu_platform": "4000", "compile_only": True},
             {"name": "NPU 5010 (Panther Lake)", "ep": "OpenVINOExecutionProvider", "npu_platform": "5010", "compile_only": True},
         ]
 
@@ -824,7 +926,8 @@ def main():
         results.append(check_polygraphy_inspect(model_path))
         results.append(check_polygraphy_capability(model_path))
     for target in targets:
-        res = run_single_target(model_path, dummy_inputs, target)
+        with report_target_progress(target.get("name", target.get("ep", "Target"))):
+            res = run_single_target(model_path, dummy_inputs, target)
         if res["status"] == "SKIPPED":
             print(f"❌ Skipping is disabled: {res['name']} is reported as FAILED ({res.get('error', '')})")
             res["status"] = "FAILED"
@@ -846,7 +949,12 @@ def main():
 
 if __name__ == "__main__":
     if len(sys.argv) >= 5 and sys.argv[1] == "--npu-aot":
-        _res = _npu_aot_compile_impl(sys.argv[2], sys.argv[3], sys.argv[4])
+        _res = _npu_aot_compile_impl(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5] if len(sys.argv) > 5 else None)
+        print("RESULT_JSON:" + json.dumps(_res), flush=True)
+        sys.exit(0)
+    if len(sys.argv) == 4 and sys.argv[1] == "--plugin-ep":
+        _target = json.loads(sys.argv[3])
+        _res = run_single_target(sys.argv[2], create_dummy_inputs(sys.argv[2]), _target)
         print("RESULT_JSON:" + json.dumps(_res), flush=True)
         sys.exit(0)
     main()

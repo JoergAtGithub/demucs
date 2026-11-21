@@ -73,20 +73,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # --- Linux x64: OpenVINO (CPU -> GPU -> All Intel NPUs) ---
+          # --- Linux x64: OpenVINO (CPU -> GPU -> Intel NPUs) ---
           - target_name: "Linux x64 - OpenVINO (CPU -> GPU -> NPUs)"
-            os: ubuntu-latest
-            pkg: "onnxruntime>=1.24.1 onnxruntime-ep-openvino openvino==2026.3.1"
+            os: ubuntu-24.04
+            pkg: "onnxruntime==1.24.1 onnxruntime-ep-openvino==1.8.1 openvino==2026.4.1"
             targets: |
               [
                 {"name": "ORT CPU", "ep": "CPUExecutionProvider"},
-                {"name": "OpenVINO CPU (Plugin EP)", "ep": "OpenVINOExecutionProvider", "options": {"device_type": "CPU"}, "plugin_ep": true},
+                {"name": "OpenVINO CPU (Plugin EP)", "ep": "OpenVINOExecutionProvider", "options": {"device_type": "CPU"}, "plugin_ep": true, "plugin_verbose": true},
                 {"name": "OpenVINO GPU", "ep": "OpenVINOExecutionProvider", "options": {"device_type": "GPU"}, "force_offline": true},
                 {"name": "NPU 3720 (Meteor/Arrow Lake)", "ep": "OpenVINOExecutionProvider", "npu_platform": "3720", "compile_only": true},
-                {"name": "NPU 4000 (Lunar Lake)", "ep": "OpenVINOExecutionProvider", "npu_platform": "4000", "compile_only": true},
                 {"name": "NPU 5010 (Panther Lake)", "ep": "OpenVINOExecutionProvider", "npu_platform": "5010", "compile_only": true},
                 {"name": "NPU 5020 (Wildcat Lake)", "ep": "OpenVINOExecutionProvider", "npu_platform": "5020", "compile_only": true, "optional_platform": true},
-                {"name": "NPU 6010 (Nova Lake)", "ep": "OpenVINOExecutionProvider", "npu_platform": "6010", "compile_only": true, "optional_platform": true}
+                {"name": "NPU 6010 (Nova Lake)", "ep": "OpenVINOExecutionProvider", "npu_platform": "6010", "compile_only": true}
               ]
 
           # --- Linux x64: NVIDIA CUDA + cuDNN + TensorRT ---
@@ -111,7 +110,7 @@ jobs:
                 {"name": "XNNPACK (ARM NEON)", "ep": "XnnpackExecutionProvider"}
               ]
 
-          # --- Windows 11 x64: OpenVINO (CPU -> GPU -> All Intel NPUs) ---
+          # --- Windows 11 x64: OpenVINO (CPU -> GPU -> Intel NPUs) ---
           - target_name: "Windows x64 - OpenVINO (CPU -> GPU -> NPUs)"
             os: windows-latest
             pkg: "onnxruntime-openvino==1.24.1 openvino==2025.4.1"
@@ -121,7 +120,6 @@ jobs:
                 {"name": "OpenVINO CPU", "ep": "OpenVINOExecutionProvider", "options": {"device_type": "CPU"}},
                 {"name": "OpenVINO GPU", "ep": "OpenVINOExecutionProvider", "options": {"device_type": "GPU"}, "skip_if_missing_hw": true},
                 {"name": "NPU 3720 (Meteor/Arrow Lake)", "ep": "OpenVINOExecutionProvider", "npu_platform": "3720", "compile_only": true},
-                {"name": "NPU 4000 (Lunar Lake)", "ep": "OpenVINOExecutionProvider", "npu_platform": "4000", "compile_only": true},
                 {"name": "NPU 5010 (Panther Lake)", "ep": "OpenVINOExecutionProvider", "npu_platform": "5010", "compile_only": true},
                 {"name": "NPU 5020 (Wildcat Lake)", "ep": "OpenVINOExecutionProvider", "npu_platform": "5020", "compile_only": true, "optional_platform": true},
                 {"name": "NPU 6010 (Nova Lake)", "ep": "OpenVINOExecutionProvider", "npu_platform": "6010", "compile_only": true, "optional_platform": true}
@@ -188,39 +186,6 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Intel Linux NPU Userspace Compiler & Level Zero
-        if: runner.os == 'Linux' && contains(matrix.pkg, 'openvino')
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -e
-          mkdir -p /tmp/npu_driver && cd /tmp/npu_driver
-
-          # 1. Install runtime dependency (TBB) and detect the Ubuntu release (24.04 / 26.04)
-          sudo apt-get update
-          sudo apt-get install -y libtbb12
-          UBUNTU_VER=$(lsb_release -rs)
-          UBUNTU_TAG=${UBUNTU_VER//./}
-          echo "Ubuntu $UBUNTU_VER -> asset suffix ubuntu${UBUNTU_TAG}"
-
-          # 2. Download and extract the latest Intel Linux NPU Driver release (contains the NPU compiler .debs)
-          echo "Release assets of intel/linux-npu-driver:"
-          gh release view --repo intel/linux-npu-driver --json tagName,assets --jq '.tagName, (.assets[].name)'
-          gh release download --repo intel/linux-npu-driver --pattern "*ubuntu${UBUNTU_TAG}.tar.gz"
-          ls -la /tmp/npu_driver
-          tar -xf linux-npu-driver-*.tar.gz
-          echo "Extracted packages:"
-          ls -la *.deb
-          for deb in *compiler*.deb; do echo "== $deb"; dpkg-deb -c "$deb" | grep -E 'libnpu_(mlir|driver)_compiler' || true; done
-
-          # 3. Install Userspace Compiler & Level Zero NPU packages (no kernel module needed for AOT)
-          sudo dpkg -i intel-driver-compiler-npu_*.deb intel-level-zero-npu_*.deb
-
-          # 4. Install the matching Level Zero loader (libze1) from the Intel graphics PPA snapshot
-          wget -q "https://snapshot.ppa.launchpadcontent.net/kobuk-team/intel-graphics/ubuntu/20260830T100000Z/pool/main/l/level-zero-loader/libze1_1.32.0-1~${UBUNTU_VER}~ppa1_amd64.deb"
-          sudo dpkg -i libze1_*.deb
-          sudo ldconfig
-
       - name: Install NVIDIA Driver Libraries
         if: matrix.install_nvidia_driver
         run: |
@@ -266,29 +231,44 @@ jobs:
           if [ -n "${{ matrix.pkg }}" ]; then pip install ${{ matrix.pkg }}; fi
           python -c "import time; print(f'⏱️ Runtime package installed in {time.perf_counter() - ${START}:.2f}s')"
 
-      - name: Link Intel NPU Compiler into OpenVINO libs
+      - name: Install matching OpenVINO NPU compiler
         if: runner.os == 'Linux' && contains(matrix.pkg, 'openvino')
         shell: bash
         run: |
+          set -euo pipefail
+          archive=npu_compiler_vcl_ubuntu_24_04-8_4_0-f45de31.tar.gz
+          curl --fail --location --retry 3 -o "$archive" "https://storage.openvinotoolkit.org/dependencies/thirdparty/linux/npu_compiler/$archive"
+          echo "27ed07ff346c49b8af4c916279d4beb361fde27c0cf290fcb3ca75f9963ab572  $archive" | sha256sum --check
+          mkdir -p /tmp/openvino-npu-compiler
+          tar -xzf "$archive" -C /tmp/openvino-npu-compiler
           OV_LIBS=$(python -c "import openvino, os; print(os.path.join(os.path.dirname(openvino.__file__), 'libs'))")
-          echo "OpenVINO libs: $OV_LIBS"
-          for lib in libnpu_mlir_compiler.so libnpu_driver_compiler.so; do
-            SRC=$(find /usr/lib /usr/local/lib -name "$lib*" 2>/dev/null | head -n 1)
-            if [ -n "$SRC" ]; then
-              sudo ln -sf "$SRC" "$OV_LIBS/$lib"
-              echo "Linked $SRC -> $OV_LIBS/$lib"
-            else
-              echo "::warning::$lib not found on system (NPU AOT compilation may fail)"
-            fi
+          install -m 755 /tmp/openvino-npu-compiler/lib/libopenvino_intel_npu_compiler.so "$OV_LIBS/"
+          install -m 755 /tmp/openvino-npu-compiler/lib/libopenvino_intel_npu_compiler_loader.so "$OV_LIBS/"
+          install -m 755 /tmp/openvino-npu-compiler/lib/libopenvino_intel_npu_vm_runtime.so "$OV_LIBS/"
+
+      - name: Test OpenVINO compatibility checks
+        if: runner.os == 'Linux' && contains(matrix.pkg, 'openvino')
+        run: |
+          python -m pip install pytest
+          python -m pytest -q tests/test_onnx_ep_checks.py
+
+      - name: Report Linux OpenVINO host resources
+        if: runner.os == 'Linux' && contains(matrix.pkg, 'onnxruntime-ep-openvino')
+        shell: bash
+        run: |
+          uname -a
+          lscpu
+          free -h
+          for file in /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.events; do
+            if [ -r "$file" ]; then echo "$file:"; cat "$file"; fi
           done
-          echo "LD_LIBRARY_PATH=$OV_LIBS:$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
 
       - name: Run Execution Provider Sequence
         shell: bash
         env:
           TEST_TARGETS: ${{ matrix.targets }}
         run: |
-          python ./scripts/test_onnx_ep.py ./onnx-models/htdemucs.onnx
+          python -u ./scripts/test_onnx_ep.py ./onnx-models/htdemucs.onnx
 
   # =====================================================================
   # JOB 3: Offline Cross-Compilation for Multiple AMD GPU Architectures
