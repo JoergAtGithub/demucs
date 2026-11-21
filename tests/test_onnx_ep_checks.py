@@ -1,4 +1,5 @@
 import json
+import re
 import threading
 import time
 from types import SimpleNamespace
@@ -7,6 +8,152 @@ import numpy as np
 import pytest
 
 from scripts import test_onnx_ep as checks
+
+
+@pytest.mark.parametrize("preflight,label", [(False, "Target"), (True, "Pre-flight check")])
+def test_check_header_uses_consistent_format(capsys, preflight, label):
+    checks.print_check_header("Example", (("Backend", "test backend"),), preflight=preflight)
+
+    lines = capsys.readouterr().out.splitlines()
+    assert lines == ["", "-" * 50, f"🎯 {label}: Example", "   Backend: test backend", "-" * 50]
+
+
+def test_missing_provider_is_an_environment_failure(monkeypatch):
+    monkeypatch.setattr(checks.ort, "get_available_providers", lambda: ["CPUExecutionProvider"])
+    result = checks.run_single_target("model.onnx", {}, {"name": "CoreML", "ep": "CoreMLExecutionProvider"})
+    assert result["status"] == "FAILED"
+    assert result["failure_phase"] == "Environment"
+    assert "not installed/available" in result["error"]
+
+
+def test_cuda_model_failure_is_not_converted_to_dry_run(monkeypatch):
+    monkeypatch.setattr(checks, "cuda_device_available", lambda: (True, "CUDA devices available: 1."))
+    monkeypatch.setattr(checks.ort, "get_available_providers", lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"])
+    monkeypatch.setattr(checks, "diagnose_cpu_fallback", lambda *args: None)
+
+    def fail_session(*args, **kwargs):
+        raise RuntimeError("model compilation failed")
+
+    def unexpected_dry_run(*args):
+        pytest.fail("model compilation failure must not trigger an offline dry-run")
+
+    monkeypatch.setattr(checks.ort, "InferenceSession", fail_session)
+    monkeypatch.setattr(checks, "check_cuda_cudnn_without_gpu", unexpected_dry_run)
+    target = {"name": "CUDA", "ep": "CUDAExecutionProvider", "allow_no_gpu_dry_run": True}
+    result = checks.run_single_target("model.onnx", {}, target)
+    assert result["status"] == "FAILED"
+    assert result["failure_phase"] == "Model check or environment"
+    assert result["error"] == "model compilation failed"
+
+
+def test_cuda_no_device_runs_limited_offline_model_check(monkeypatch):
+    monkeypatch.setattr(checks, "cuda_device_available", lambda: (False, "CUDA reports no device."))
+    expected = {"name": "CUDA", "status": "PASSED (DRY)"}
+    monkeypatch.setattr(checks, "check_cuda_cudnn_without_gpu", lambda model, name: expected)
+    target = {"name": "CUDA", "ep": "CUDAExecutionProvider", "allow_no_gpu_dry_run": True}
+    assert checks.run_single_target("model.onnx", {}, target) == expected
+
+
+def test_cuda_offline_check_distinguishes_environment_and_model_errors(monkeypatch):
+    monkeypatch.setattr(checks, "verify_cudnn_libraries", lambda: (False, "missing cuDNN"))
+    result = checks.check_cuda_cudnn_without_gpu("model.onnx", "CUDA")
+    assert result["failure_phase"] == "Environment" and result["status"] == "FAILED"
+
+    monkeypatch.setattr(checks, "verify_cudnn_libraries", lambda: (True, "cuDNN loaded"))
+    monkeypatch.setattr(checks.ort, "get_available_providers", lambda: ["CUDAExecutionProvider"])
+    def fail_load(path):
+        raise ValueError("invalid model")
+    monkeypatch.setattr(checks.onnx, "load", fail_load)
+    result = checks.check_cuda_cudnn_without_gpu("model.onnx", "CUDA")
+    assert result["failure_phase"] == "Model check" and result["error"] == "invalid model"
+
+
+def test_cuda_driver_error_is_not_treated_as_missing_gpu(monkeypatch):
+    driver = SimpleNamespace(cuInit=lambda flags: 999)
+    monkeypatch.setattr(checks.sys, "platform", "linux")
+    monkeypatch.setattr(checks.ctypes, "CDLL", lambda name: driver)
+    with pytest.raises(RuntimeError, match="cuInit failed with CUDA error 999"):
+        checks.cuda_device_available()
+
+
+def test_directml_missing_runtime_is_environment_failure(monkeypatch):
+    monkeypatch.setattr(checks.glob, "glob", lambda *args, **kwargs: [])
+    result = checks.run_directml_offline_check("model.onnx")
+    assert result["status"] == "FAILED"
+    assert result["failure_phase"] == "Environment"
+    assert "DirectML.dll" in result["error"]
+
+
+def test_failure_phase_and_error_appear_in_summary(capsys):
+    result = checks.failed_check("CUDA", "missing runtime", "Environment")
+    checks.print_results_summary([result], None)
+    output = capsys.readouterr().out
+    assert "CUDA [Environment]: missing runtime" in output
+
+
+def test_openvino_runtime_cpu_compiles_and_runs_model_twice(monkeypatch):
+    calls = []
+    inputs = {"input": np.ones((1, 2, 4), dtype=np.float32)}
+
+    class Compiled:
+        def get_property(self, key):
+            assert key == "EXECUTION_DEVICES"
+            return ["CPU"]
+
+        def __call__(self, value):
+            assert value is inputs
+            calls.append("inference")
+            return {"output": np.ones((1, 4, 2, 4), dtype=np.float32)}
+
+    class Core:
+        available_devices = ["CPU"]
+
+        def read_model(self, path):
+            calls.append(("read", path))
+            return "model"
+
+        def compile_model(self, model, device):
+            calls.append(("compile", model, device))
+            return Compiled()
+
+    monkeypatch.setitem(checks.sys.modules, "openvino", SimpleNamespace(Core=Core))
+    result = checks.run_single_target("model.onnx", inputs, {"name": "OpenVINO CPU (Runtime)", "backend": "openvino_cpu"})
+    assert result["status"] == "PASSED"
+    assert calls == [("read", "model.onnx"), ("compile", "model", "CPU"), "inference", "inference"]
+
+
+@pytest.mark.parametrize("mode,phase", [
+    ("missing_cpu", "Environment"),
+    ("compile_error", "Model check or environment"),
+    ("wrong_device", "Model check or environment"),
+    ("invalid_output", "Model execution or environment"),
+    ("empty_output", "Model execution or environment"),
+])
+def test_openvino_runtime_cpu_failures_are_not_passed(monkeypatch, mode, phase):
+    class Compiled:
+        def get_property(self, key):
+            return ["GPU"] if mode == "wrong_device" else ["CPU"]
+
+        def __call__(self, inputs):
+            if mode == "empty_output":
+                return {}
+            return {"output": np.array([np.nan])}
+
+    class Core:
+        available_devices = [] if mode == "missing_cpu" else ["CPU"]
+
+        def read_model(self, path):
+            return "model"
+
+        def compile_model(self, model, device):
+            if mode == "compile_error":
+                raise RuntimeError("compile failed")
+            return Compiled()
+
+    monkeypatch.setitem(checks.sys.modules, "openvino", SimpleNamespace(Core=Core))
+    result = checks.run_openvino_cpu_model("model.onnx", {}, "OpenVINO CPU (Runtime)")
+    assert result["status"] == "FAILED"
+    assert result["failure_phase"] == phase
 
 
 def test_audio_benchmark_covers_entire_track_and_reports_speed(monkeypatch):
@@ -354,7 +501,7 @@ def test_target_heartbeat_stops_after_target(monkeypatch):
     count = len(messages)
     time.sleep(0.05)
     assert len(messages) == count
-    assert any("NPU 3720" in message and "not compiler progress" in message for message in messages)
+    assert any(re.match(r"⏳ NPU 3720: still running - elapsed time: \d+s$", message) for message in messages)
 
 
 @pytest.mark.parametrize("output", ["nothing", "RESULT_JSON:invalid", "RESULT_JSON:[]"])

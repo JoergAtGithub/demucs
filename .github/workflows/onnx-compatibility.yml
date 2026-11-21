@@ -80,7 +80,7 @@ jobs:
             targets: |
               [
                 {"name": "ORT CPU", "ep": "CPUExecutionProvider"},
-                {"name": "OpenVINO CPU (Plugin EP)", "ep": "OpenVINOExecutionProvider", "options": {"device_type": "CPU"}, "plugin_ep": true, "plugin_verbose": true},
+                {"name": "OpenVINO CPU (Runtime)", "backend": "openvino_cpu"},
                 {"name": "OpenVINO GPU", "ep": "OpenVINOExecutionProvider", "options": {"device_type": "GPU"}, "force_offline": true},
                 {"name": "NPU 3720 (Meteor/Arrow Lake)", "ep": "OpenVINOExecutionProvider", "npu_platform": "3720", "compile_only": true},
                 {"name": "NPU 5010 (Panther Lake)", "ep": "OpenVINOExecutionProvider", "npu_platform": "5010", "compile_only": true},

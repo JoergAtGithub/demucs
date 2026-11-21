@@ -22,6 +22,15 @@ if len(sys.argv) < 2 or sys.argv[1] != "--plugin-ep":
 import onnxruntime as ort
 
 
+def print_check_header(name, details=(), preflight=False):
+    print("\n" + "-" * 50)
+    label = "Pre-flight check" if preflight else "Target"
+    print(f"🎯 {label}: {name}")
+    for label, value in details:
+        print(f"   {label}: {value}")
+    print("-" * 50)
+
+
 def resolve_shape(shape_proto, default_audio_samples=44100 * 5):
     """Replace dynamic dimensions with fixed test values (required for NPU & CoreML)."""
     resolved = []
@@ -170,15 +179,33 @@ def verify_cudnn_libraries():
     return True, f"Loaded cuDNN library: {os.path.basename(primary)}"
 
 
-def provider_is_usable(model_path, provider):
-    """Return True if the provider can really be created (libraries and GPU present)."""
+def cuda_device_available():
+    """Check CUDA device availability without compiling or executing the model."""
     try:
-        opts = ort.SessionOptions()
-        opts.log_severity_level = 4
-        session = ort.InferenceSession(model_path, sess_options=opts, providers=[provider, "CPUExecutionProvider"])
-        return provider in session.get_providers()
-    except Exception:
-        return False
+        driver = ctypes.WinDLL("nvcuda.dll") if sys.platform == "win32" else ctypes.CDLL("libcuda.so.1")
+    except OSError:
+        return False, "CUDA driver library not available; no CUDA device can be accessed."
+    try:
+        result = driver.cuInit(0)
+        if result == 100:
+            return False, "CUDA reports no device."
+        if result != 0:
+            raise RuntimeError(f"cuInit failed with CUDA error {result}.")
+        count = ctypes.c_int()
+        result = driver.cuDeviceGetCount(ctypes.byref(count))
+        if result == 100:
+            return False, "CUDA reports no device."
+        if result != 0:
+            raise RuntimeError(f"cuDeviceGetCount failed with CUDA error {result}.")
+        return count.value > 0, f"CUDA devices available: {count.value}."
+    except (AttributeError, OSError) as exc:
+        raise RuntimeError(f"CUDA driver readiness check failed: {exc}") from exc
+
+
+def failed_check(name, message, phase, compile_s=0.0, warmup_s=0.0, infer_s=0.0):
+    print(f"❌ {phase} failed: {message}")
+    return {"name": name, "status": "FAILED", "compile_s": compile_s, "warmup_s": warmup_s,
+            "infer_s": infer_s, "error": message, "failure_phase": phase}
 
 
 def check_cuda_cudnn_without_gpu(model_path, target_name):
@@ -186,25 +213,27 @@ def check_cuda_cudnn_without_gpu(model_path, target_name):
     t1 = time.perf_counter()
     cudnn_ok, cudnn_msg = verify_cudnn_libraries()
     if not cudnn_ok:
-        print(f"❌ cuDNN ERROR: {cudnn_msg}")
-        return {"name": target_name, "status": "FAILED", "compile_s": 0.0, "warmup_s": 0.0, "infer_s": 0.0, "error": cudnn_msg}
+        return failed_check(target_name, cudnn_msg, "Environment")
 
     providers = ort.get_available_providers()
     if "CUDAExecutionProvider" not in providers:
         msg = f"CUDAExecutionProvider missing from onnxruntime-gpu build (found: {providers})."
-        print(f"❌ ERROR: {msg}")
-        return {"name": target_name, "status": "FAILED", "compile_s": 0.0, "warmup_s": 0.0, "infer_s": 0.0, "error": msg}
+        return failed_check(target_name, msg, "Environment")
 
-    model = onnx.load(model_path)
-    onnx.checker.check_model(model, full_check=True)
-    inferred = onnx.shape_inference.infer_shapes(model, strict_mode=True)
+    print(f"✅ Environment ready for offline model validation: {cudnn_msg}")
+    try:
+        model = onnx.load(model_path)
+        onnx.checker.check_model(model, full_check=True)
+        inferred = onnx.shape_inference.infer_shapes(model, strict_mode=True)
+    except Exception as exc:
+        return failed_check(target_name, str(exc), "Model check", compile_s=time.perf_counter() - t1)
     opsets = {op.domain or "ai.onnx": op.version for op in inferred.opset_import}
     t_compile = time.perf_counter() - t1
 
     print(f"ℹ️  {cudnn_msg}")
     print(f"ℹ️  CUDA + cuDNN EP registered in ORT. Verified opsets: {opsets}")
-    print("⚠️  No physical NVIDIA GPU on runner (PTX/cuDNN kernels are compatible across Turing/Ampere/Ada/Hopper/Blackwell).")
-    print(f"✅ CUDA + cuDNN dry-run & strict graph validation passed in {t_compile:.3f}s!")
+    print("⚠️  No accessible NVIDIA GPU; CUDA model compilation and execution were not tested.")
+    print(f"✅ Offline ONNX graph validation passed in {t_compile:.3f}s.")
     return {"name": target_name, "status": "PASSED (DRY)", "compile_s": t_compile, "warmup_s": 0.0, "infer_s": 0.0, "error": ""}
 
 
@@ -227,17 +256,13 @@ def run_migraphx_offline(model_path, target):
     gfx_arch = target["gfx_arch"]
     optional_arch = target.get("optional_arch", False)
 
-    print("\n--------------------------------------------------")
-    print(f"🎯 Target:              {name}")
-    print("🔌 Backend:             AMD MIGraphX AOT Compiler")
-    print(f"🧠 Target GPU Arch:     {gfx_arch}")
-    print("--------------------------------------------------")
+    print_check_header(name, (("Backend", "AMD MIGraphX AOT Compiler"), ("Target GPU Arch", gfx_arch)))
 
     driver = find_migraphx_driver()
     if driver is None:
         msg = "migraphx-driver not found on PATH or under /opt/rocm*."
-        print(f"\u274c ERROR: {msg}")
-        return {"name": name, "status": "FAILED", "compile_s": 0.0, "warmup_s": 0.0, "infer_s": 0.0, "error": msg}
+        return failed_check(name, msg, "Environment")
+    print("✅ Environment ready for model cross-compilation.")
     print(f"\u2139\ufe0f  Using {driver}")
 
     cmd = [driver, "compile", "--gpu", "--gpu-arch", gfx_arch, model_path]
@@ -358,7 +383,7 @@ def report_target_progress(name, interval=30):
     def report():
         while not finished.wait(interval):
             elapsed = time.monotonic() - started
-            print(f"⏳ {name}: still running after {elapsed:.0f}s (elapsed time, not compiler progress).", flush=True)
+            print(f"⏳ {name}: still running - elapsed time: {elapsed:.0f}s", flush=True)
 
     print(f"▶️ Starting {name}.", flush=True)
     reporter = threading.Thread(target=report, daemon=True)
@@ -475,14 +500,15 @@ def run_openvino_gpu_offline_check(model_path, name):
         gpu_plugins = glob.glob(os.path.join(ov_dir, "**", "*intel_gpu_plugin*"), recursive=True)
         if not gpu_plugins:
             raise FileNotFoundError("OpenVINO Intel GPU plugin library is missing from the installation.")
-        print(f"📦 GPU plugin: {gpu_plugins[0]}")
+    except Exception as e:
+        return failed_check(name, str(e), "Environment", compile_s=time.perf_counter() - t0)
+    print(f"📦 GPU plugin: {gpu_plugins[0]}")
+    try:
         model = ov.Core().read_model(model_path)
         with tempfile.TemporaryDirectory() as tmp:
             ov.serialize(model, os.path.join(tmp, "temp_ov_gpu.xml"), os.path.join(tmp, "temp_ov_gpu.bin"))
     except Exception as e:
-        msg = str(e)
-        print(f"❌ OpenVINO GPU offline check ERROR: {msg}")
-        return {"name": name, "status": "FAILED", "compile_s": time.perf_counter() - t0, "warmup_s": 0.0, "infer_s": 0.0, "error": msg}
+        return failed_check(name, str(e), "Model check or environment", compile_s=time.perf_counter() - t0)
     compile_s = round(time.perf_counter() - t0, 3)
     print(f"✅ OpenVINO GPU plugin & IR serialization PASSED in {compile_s:.3f}s. GPU compilation and loading were not tested.")
     return {"name": name, "status": "PASSED (IR)", "compile_s": compile_s, "warmup_s": 0.0, "infer_s": 0.0, "error": ""}
@@ -494,8 +520,7 @@ def _npu_aot_compile_impl(model_path, name, platform, log_level=None):
         import openvino as ov
     except ImportError as e:
         msg = f"openvino Python package not installed: {e}"
-        print(f"❌ ERROR: {msg}")
-        return {"name": name, "status": "FAILED", "compile_s": 0.0, "warmup_s": 0.0, "infer_s": 0.0, "error": msg}
+        return failed_check(name, msg, "Environment")
     t0 = time.perf_counter()
     try:
         core = ov.Core()
@@ -523,8 +548,7 @@ def _npu_aot_compile_impl(model_path, name, platform, log_level=None):
         size_mb = len(blob.getvalue()) / (1024 * 1024)
     except Exception as e:
         msg = str(e)
-        print(f"❌ NPU {platform} AOT COMPILE ERROR:\n{msg}")
-        return {"name": name, "status": "FAILED", "compile_s": time.perf_counter() - t0, "warmup_s": 0.0, "infer_s": 0.0, "error": msg}
+        return failed_check(name, msg, "Model check or environment", compile_s=time.perf_counter() - t0)
     print(f"✅ NPU {platform} AOT compile PASSED in {t_compile:.3f}s (blob: {size_mb:.2f} MB)")
     return {"name": name, "status": "PASSED (AOT)", "compile_s": t_compile, "warmup_s": 0.0, "infer_s": 0.0, "error": ""}
 
@@ -546,14 +570,12 @@ def run_directml_offline_check(onnx_path, target_name="DirectML (Offline Check)"
     Validates DirectML runtime availability (DirectML.dll + d3d12.dll) and checks
     ONNX graph compatibility for DirectML on headless Windows runners without a GPU.
     """
-    print("-" * 50)
-    print(f"🎯 Target:              {target_name}")
-    print("🔌 Execution Provider:  DmlExecutionProvider (Offline Runtime & Graph Check)")
-    print("⚙️  EP Options:          {}")
-    print("-" * 50)
+    print_check_header(target_name, (("Execution Provider", "DmlExecutionProvider (Offline Runtime & Graph Check)"),
+                                     ("EP Options", {})))
 
     t0 = time.perf_counter()
 
+    phase = "Environment"
     try:
         # 1. Verify that DirectML.dll is bundled with onnxruntime-directml and loadable
         ort_dir = os.path.dirname(ort.__file__)
@@ -569,6 +591,8 @@ def run_directml_offline_check(onnx_path, target_name="DirectML (Offline Check)"
         if not hasattr(d3d12_lib, "D3D12CreateDevice"):
             raise AttributeError("Symbol 'D3D12CreateDevice' is missing in d3d12.dll.")
 
+        print("✅ Environment ready for offline DirectML model checks.")
+        phase = "Model check"
         # 2. Load ONNX model and validate DirectML opset limits (DirectML supports up to Opset 21)
         model = onnx.load(onnx_path, load_external_data=False)
         opset = max((o.version for o in model.opset_import if o.domain in ("", "ai.onnx")), default=0)
@@ -599,8 +623,7 @@ def run_directml_offline_check(onnx_path, target_name="DirectML (Offline Check)"
     except Exception as exc:
         compile_s = round(time.perf_counter() - t0, 3)
         error_msg = str(exc)
-        print(f"❌ ERROR: {error_msg}")
-        return {"name": target_name, "status": "FAILED", "compile_s": compile_s, "warmup_s": 0.0, "infer_s": 0.0, "error": error_msg}
+        return failed_check(target_name, error_msg, phase, compile_s=compile_s)
 
 
 _registered_plugin_eps = set()
@@ -647,6 +670,48 @@ def create_plugin_ep_session(model_path, sess_options, ep_options, verbose=False
     return ort.InferenceSession(model_path, sess_options=sess_options)
 
 
+def run_openvino_cpu_model(model_path, dummy_inputs, name):
+    print_check_header(name, (("Backend", "OpenVINO Runtime"), ("Device", "CPU")))
+    try:
+        import openvino as ov
+        core = ov.Core()
+        if "CPU" not in core.available_devices:
+            return failed_check(name, f"OpenVINO CPU device is unavailable: {core.available_devices}", "Environment")
+    except Exception as exc:
+        return failed_check(name, str(exc), "Environment")
+
+    started = time.perf_counter()
+    try:
+        model = core.read_model(model_path)
+        compiled = core.compile_model(model, "CPU")
+        devices = compiled.get_property("EXECUTION_DEVICES")
+        if not devices or any(device != "CPU" for device in devices):
+            raise RuntimeError(f"OpenVINO did not compile exclusively for CPU: {devices}")
+    except Exception as exc:
+        return failed_check(name, str(exc), "Model check or environment", compile_s=time.perf_counter() - started)
+    compile_s = time.perf_counter() - started
+    print(f"⏱️ [Step 1] Model load & compilation: {compile_s:.3f}s (devices: {devices})")
+
+    timings = []
+    for label in ("Warmup", "Steady"):
+        started = time.perf_counter()
+        try:
+            outputs = compiled(dummy_inputs)
+            if not outputs:
+                raise ValueError("OpenVINO returned no model outputs.")
+            for output in outputs.values():
+                if not np.isfinite(output).all():
+                    raise ValueError("OpenVINO model output contains non-finite values.")
+        except Exception as exc:
+            return failed_check(name, str(exc), "Model execution or environment", compile_s=compile_s,
+                                warmup_s=timings[0] if timings else 0.0)
+        timings.append(time.perf_counter() - started)
+        print(f"⏱️ {label} inference: {timings[-1]:.3f}s")
+    print(f"✅ OpenVINO Runtime CPU model compilation and inference passed for {name}.")
+    return {"name": name, "status": "PASSED", "compile_s": compile_s, "warmup_s": timings[0],
+            "infer_s": timings[1], "error": ""}
+
+
 def run_single_target(model_path, dummy_inputs, target, benchmark_input=None):
     """Run compilation and optional inference for a single EP/device configuration."""
     if target.get("backend") == "migraphx_cli":
@@ -655,12 +720,13 @@ def run_single_target(model_path, dummy_inputs, target, benchmark_input=None):
     if target.get("backend") == "directml_offline":
         return run_directml_offline_check(model_path, target.get("name", "DirectML (Offline Check)"))
 
+    if target.get("backend") == "openvino_cpu":
+        return run_openvino_cpu_model(model_path, dummy_inputs, target.get("name", "OpenVINO Runtime CPU"))
+
     if target.get("npu_platform"):
         name = target.get("name", target["ep"])
-        print("\n--------------------------------------------------")
-        print(f"🎯 Target:              {name}")
-        print(f"🧠 Target NPU Platform: {target['npu_platform']} (OpenVINO API AOT compile, no ORT session)")
-        print("--------------------------------------------------")
+        print_check_header(name, (("Target NPU Platform",
+                                   f"{target['npu_platform']} (OpenVINO API AOT compile, no ORT session)"),))
         return test_npu_aot_compile(
             model_path, name, target["npu_platform"],
             log_level=target.get("npu_log_level"),
@@ -701,18 +767,21 @@ def run_single_target(model_path, dummy_inputs, target, benchmark_input=None):
         ep_options["device_type"] = "NPU"
         ep_options["load_config"] = temp_config_path
 
-    print("\n--------------------------------------------------")
-    print(f"🎯 Target:              {name}")
-    print(f"🔌 Execution Provider:  {target_ep}")
+    details = [("Execution Provider", target_ep)]
     if npu_platform:
-        print(f"🧠 Target NPU Platform: {npu_platform} (AOT Plugin Compiler)")
-    print(f"⚙️  EP Options:          {ep_options}")
-    print("--------------------------------------------------")
+        details.append(("Target NPU Platform", f"{npu_platform} (AOT Plugin Compiler)"))
+    details.append(("EP Options", ep_options))
+    print_check_header(name, details)
 
     try:
         # Handle NVIDIA CUDA + cuDNN dry-run on CPU-only runners
         if target_ep == "CUDAExecutionProvider" and target.get("allow_no_gpu_dry_run", False):
-            if not provider_is_usable(model_path, "CUDAExecutionProvider"):
+            try:
+                available, message = cuda_device_available()
+            except RuntimeError as exc:
+                return failed_check(name, str(exc), "Environment")
+            print(f"ℹ️  CUDA environment: {message}")
+            if not available:
                 return check_cuda_cudnn_without_gpu(model_path, name)
 
         # Check physical hardware availability for OpenVINO GPU (requires OpenCL driver)
@@ -727,8 +796,9 @@ def run_single_target(model_path, dummy_inputs, target, benchmark_input=None):
             if target.get("skip_if_unavailable", False):
                 print(f"⏭️  SKIPPED: {msg}")
                 return {"name": name, "status": "SKIPPED", "compile_s": 0.0, "warmup_s": 0.0, "infer_s": 0.0, "error": msg}
-            print(f"❌ ERROR: {msg}")
-            return {"name": name, "status": "FAILED", "compile_s": 0.0, "warmup_s": 0.0, "infer_s": 0.0, "error": msg}
+            return failed_check(name, msg, "Environment")
+
+        print("ℹ️  Checking provider prerequisites and model compatibility.")
 
         # Per-op CPU fallback is allowed; only a provider that cannot be created at all is an error
         sess_options = ort.SessionOptions()
@@ -759,7 +829,7 @@ def run_single_target(model_path, dummy_inputs, target, benchmark_input=None):
                     diagnose_cpu_fallback(model_path, target_ep, ep_options)
                 except Exception as diag_err:
                     print(f"   Diagnosis failed: {diag_err}")
-            return {"name": name, "status": "FAILED", "compile_s": 0.0, "warmup_s": 0.0, "infer_s": 0.0, "error": err_str}
+            return failed_check(name, err_str, "Model check or environment")
 
         t_compile = time.perf_counter() - t1
         print(f"⏱️ [Step 1] Session & Compilation:   {t_compile:.3f}s")
@@ -771,8 +841,7 @@ def run_single_target(model_path, dummy_inputs, target, benchmark_input=None):
                 msg = "No Intel NPU device visible to OpenVINO on this runner (skipped)."
                 print(f"⏭️  SKIPPED: {msg}")
                 return {"name": name, "status": "SKIPPED", "compile_s": t_compile, "warmup_s": 0.0, "infer_s": 0.0, "error": msg}
-            print(f"❌ ERROR: {msg}")
-            return {"name": name, "status": "FAILED", "compile_s": t_compile, "warmup_s": 0.0, "infer_s": 0.0, "error": msg}
+            return failed_check(name, msg, "Environment", compile_s=t_compile)
 
         if target_ep != "CPUExecutionProvider" and not plugin_ep:
             print("⚠️  Note: individual ops may fall back to the CPU EP (informational, not an error).")
@@ -791,7 +860,7 @@ def run_single_target(model_path, dummy_inputs, target, benchmark_input=None):
             outputs = session.run(None, dummy_inputs)
         except Exception as e:
             print(f"❌ WARMUP INFERENCE ERROR on {name}:\n{e}")
-            return {"name": name, "status": "FAILED", "compile_s": t_compile, "warmup_s": 0.0, "infer_s": 0.0, "error": str(e)}
+            return failed_check(name, str(e), "Model execution or environment", compile_s=t_compile)
         t_warmup = time.perf_counter() - t2
         print(f"⏱️ [Step 2] 1st Inference (Warmup):  {t_warmup:.3f}s")
 
@@ -801,7 +870,7 @@ def run_single_target(model_path, dummy_inputs, target, benchmark_input=None):
             outputs = session.run(None, dummy_inputs)
         except Exception as e:
             print(f"❌ STEADY INFERENCE ERROR on {name}:\n{e}")
-            return {"name": name, "status": "FAILED", "compile_s": t_compile, "warmup_s": t_warmup, "infer_s": 0.0, "error": str(e)}
+            return failed_check(name, str(e), "Model execution or environment", compile_s=t_compile, warmup_s=t_warmup)
         t_infer = time.perf_counter() - t3
         print(f"⏱️ [Step 3] 2nd Inference (Steady):  {t_infer:.3f}s")
 
@@ -835,9 +904,7 @@ def _result(name, status, t, error=""):
 def check_onnx_structure(model_path):
     """ONNX checker (full), strict shape inference and a plain ORT CPU session to catch structural errors."""
     name = "ONNX Checker + Shape Inference + ORT CPU"
-    print("\n--------------------------------------------------")
-    print(f"🎯 Pre-flight check:    {name}")
-    print("--------------------------------------------------")
+    print_check_header(name, preflight=True)
     t0 = time.perf_counter()
     try:
         onnx.checker.check_model(model_path, full_check=True)
@@ -889,9 +956,7 @@ def find_polygraphy():
 
 def _run_polygraphy(name, args, max_lines=60, timeout=600):
 	"""Run one polygraphy sub-command and return a result dict. A native crash counts as FAILED."""
-	print("\n--------------------------------------------------")
-	print(f"🎯 Pre-flight check:    {name}")
-	print("--------------------------------------------------")
+	print_check_header(name, preflight=True)
 	t0 = time.perf_counter()
 	exe = find_polygraphy()
 	if exe is None:
@@ -932,9 +997,7 @@ def check_polygraphy_inspect(model_path):
 def check_polygraphy_capability(model_path):
 	"""Static TensorRT compatibility check (no GPU needed; `polygraphy inspect capability` requires trt.Builder and a GPU)."""
 	name = "Static TensorRT Op/Opset Check"
-	print("\n--------------------------------------------------")
-	print(f"🎯 Pre-flight check:    {name}")
-	print("--------------------------------------------------")
+	print_check_header(name, preflight=True)
 	t0 = time.perf_counter()
 	unsupported_ops = {"STFT", "InverseSTFT", "StringNormalizer", "TfIdfVectorizer"}
 	complex_types = (onnx.TensorProto.COMPLEX64, onnx.TensorProto.COMPLEX128)
@@ -959,13 +1022,51 @@ def check_polygraphy_capability(model_path):
 	return {"name": name, "status": "PASSED", "compile_s": elapsed, "warmup_s": 0.0, "infer_s": 0.0, "error": ""}
 
 
+def print_results_summary(results, audio_path):
+    headers = ("Target", "Status", "Compile (s)", "Warmup (s)", "Steady (s)", "Processing speed")
+    rows = [
+        (r["name"], r["status"], f"{r['compile_s']:.3f}", f"{r['warmup_s']:.3f}",
+         f"{r['infer_s']:.3f}", f"{r['processing_speed']:.2f}x" if "processing_speed" in r else "N/A")
+        for r in results
+    ]
+    widths = [max(len(str(row[i])) for row in [headers, *rows]) for i in range(len(headers))]
+
+    def format_row(row):
+        return " | ".join(str(value).ljust(widths[i]) if i < 2 else str(value).rjust(widths[i])
+                          for i, value in enumerate(row))
+
+    separator = "-+-".join("-" * width for width in widths)
+    print("\n" + format_row(headers))
+    print(separator)
+    for row in rows:
+        print(format_row(row))
+    failures = [r for r in results if r["status"] == "FAILED"]
+    if failures:
+        print("\nFailed checks:")
+        for result in failures:
+            print(f"  {result['name']} [{result.get('failure_phase', 'Unclassified')}]: {result.get('error', '')}")
+    if audio_path and os.environ.get("GITHUB_STEP_SUMMARY"):
+        summary = ["| Target | Status | Compile (s) | Processing speed |", "| --- | --- | ---: | ---: |"]
+        for row in rows:
+            name, status, compile_time, _, _, speed = row
+            summary.append(f"| {name.replace('|', '/')} | {status} | {compile_time} | {speed} |")
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary_file:
+            summary_file.write("## Real-audio ONNX benchmark\n\n" + "\n".join(summary) + "\n\n")
+            summary_file.write("Processing speed is audio duration divided by processing time, excluding session initialization and warmup. "
+                               "Processing includes normalization, 25% overlapping model inference and reconstruction; file loading is excluded. "
+                               "CoreML compute units permit CPU fallback and do not guarantee GPU or Neural Engine placement.\n")
+            if failures:
+                summary_file.write("\nFailed checks:\n\n")
+                for result in failures:
+                    summary_file.write(f"- {result['name']} [{result.get('failure_phase', 'Unclassified')}]: {result.get('error', '')}\n")
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: python test_onnx_ep.py <path_to_onnx>")
         sys.exit(1)
 
     model_path = sys.argv[1]
-
     raw_targets = os.environ.get("TEST_TARGETS")
     if raw_targets:
         targets = json.loads(raw_targets)
@@ -1003,36 +1104,8 @@ def main():
             res["status"] = "FAILED"
         results.append(res)
 
-    headers = ("Target", "Status", "Compile (s)", "Warmup (s)", "Steady (s)", "Processing speed")
-    rows = [
-        (r["name"], r["status"], f"{r['compile_s']:.3f}", f"{r['warmup_s']:.3f}",
-         f"{r['infer_s']:.3f}", f"{r['processing_speed']:.2f}x" if "processing_speed" in r else "N/A")
-        for r in results
-    ]
-    widths = [max(len(str(row[i])) for row in [headers, *rows]) for i in range(len(headers))]
-
-    def format_row(row):
-        return " | ".join(str(value).ljust(widths[i]) if i < 2 else str(value).rjust(widths[i])
-                          for i, value in enumerate(row))
-
-    separator = "-+-".join("-" * width for width in widths)
-    print("\n" + format_row(headers))
-    print(separator)
-    for row in rows:
-        print(format_row(row))
-    has_failure = any(r["status"] == "FAILED" for r in results)
-    if audio_path and os.environ.get("GITHUB_STEP_SUMMARY"):
-        summary = ["| Target | Status | Compile (s) | Processing speed |", "| --- | --- | ---: | ---: |"]
-        for row in rows:
-            name, status, compile_time, _, _, speed = row
-            summary.append(f"| {name.replace('|', '/')} | {status} | {compile_time} | {speed} |")
-        with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary_file:
-            summary_file.write("## Real-audio ONNX benchmark\n\n" + "\n".join(summary) + "\n\n")
-            summary_file.write("Processing speed is audio duration divided by processing time, excluding session initialization and warmup. "
-                               "Processing includes normalization, 25% overlapping model inference and reconstruction; file loading is excluded. "
-                               "CoreML compute units permit CPU fallback and do not guarantee GPU or Neural Engine placement.\n")
-
-    sys.exit(1 if has_failure else 0)
+    print_results_summary(results, audio_path)
+    sys.exit(1 if any(r["status"] == "FAILED" for r in results) else 0)
 
 
 if __name__ == "__main__":
