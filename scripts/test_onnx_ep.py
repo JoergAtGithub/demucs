@@ -66,6 +66,65 @@ def create_dummy_inputs(model_path):
     return inputs
 
 
+def load_benchmark_audio(path):
+    import soundfile as sf
+
+    audio, sample_rate = sf.read(path, dtype="float32", always_2d=True)
+    if sample_rate != 44100 or audio.shape[1] != 2 or not len(audio):
+        raise ValueError(f"Benchmark audio must be nonempty 44.1 kHz stereo; got {sample_rate} Hz and shape {audio.shape}.")
+    if not np.isfinite(audio).all():
+        raise ValueError("Benchmark audio contains non-finite samples.")
+    print(f"🎵 Benchmark audio: {path}, {len(audio) / sample_rate:.3f}s, {sample_rate} Hz stereo")
+    return np.ascontiguousarray(audio.T), sample_rate
+
+
+def benchmark_audio(session, dummy_inputs, audio, sample_rate):
+    if len(dummy_inputs) != 1:
+        raise ValueError("Audio benchmark requires a single model input.")
+    input_name, example = next(iter(dummy_inputs.items()))
+    if example.ndim != 3 or example.shape[:2] != (1, 2) or example.shape[2] <= 0 or example.dtype != np.float32:
+        raise ValueError(f"Audio benchmark requires a float32 [1, 2, samples] input; got {example.shape}, {example.dtype}.")
+    if sample_rate != 44100 or audio.ndim != 2 or audio.shape[0] != 2 or audio.shape[1] == 0:
+        raise ValueError("Audio benchmark requires nonempty 44.1 kHz stereo audio.")
+
+    chunk_size = example.shape[2]
+    stride = max(1, int(chunk_size * 0.75))
+    length = audio.shape[1]
+    started = time.perf_counter()
+    reference = audio.mean(axis=0)
+    mean = reference.mean()
+    std = reference.std(ddof=1) if length > 1 else 0.0
+    normalized = (audio - mean) / (std + 1e-8)
+    weights = np.minimum(np.arange(1, chunk_size + 1), np.arange(chunk_size, 0, -1)).astype(np.float32)
+    weights /= weights.max()
+    total_weights = np.zeros(length, dtype=np.float32)
+    separated = None
+    for offset in range(0, length, stride):
+        count = min(chunk_size, length - offset)
+        chunk = np.zeros((1, 2, chunk_size), dtype=np.float32)
+        chunk[0, :, :count] = normalized[:, offset:offset + count]
+        outputs = session.run(None, {input_name: chunk})
+        if len(outputs) != 1 or outputs[0].ndim != 4 or outputs[0].shape[0] != 1 or outputs[0].shape[2:] != (2, chunk_size):
+            raise ValueError("Audio benchmark requires one [1, sources, 2, samples] output matching the input length.")
+        output = outputs[0][0]
+        if not np.isfinite(output).all():
+            raise ValueError("Audio benchmark output contains non-finite samples.")
+        if separated is None:
+            separated = np.zeros((output.shape[0], 2, length), dtype=np.float32)
+        elif separated.shape[0] != output.shape[0]:
+            raise ValueError("Audio benchmark output source count changed between chunks.")
+        separated[:, :, offset:offset + count] += output[:, :, :count] * weights[:count]
+        total_weights[offset:offset + count] += weights[:count]
+    separated /= total_weights
+    separated *= std + 1e-8
+    separated += mean
+    elapsed = time.perf_counter() - started
+    if elapsed <= 0:
+        raise ValueError("Audio benchmark elapsed time must be positive.")
+    duration = length / sample_rate
+    return {"audio_s": duration, "audio_processing_s": elapsed, "processing_speed": duration / elapsed}
+
+
 def get_openvino_devices():
     """Return available OpenVINO hardware devices if openvino package is installed."""
     try:
@@ -588,7 +647,7 @@ def create_plugin_ep_session(model_path, sess_options, ep_options, verbose=False
     return ort.InferenceSession(model_path, sess_options=sess_options)
 
 
-def run_single_target(model_path, dummy_inputs, target):
+def run_single_target(model_path, dummy_inputs, target, benchmark_input=None):
     """Run compilation and optional inference for a single EP/device configuration."""
     if target.get("backend") == "migraphx_cli":
         return run_migraphx_offline(model_path, target)
@@ -753,8 +812,17 @@ def run_single_target(model_path, dummy_inputs, target):
                 return {"name": name, "status": "FAILED", "compile_s": t_compile, "warmup_s": t_warmup, "infer_s": t_infer, "error": msg}
             print(f"   Output[{idx}]: Shape={out.shape}, Min={out.min():.4f}, Max={out.max():.4f}")
 
+        result = {"name": name, "status": "PASSED", "compile_s": t_compile, "warmup_s": t_warmup, "infer_s": t_infer, "error": ""}
+        if benchmark_input is not None:
+            try:
+                result.update(benchmark_audio(session, dummy_inputs, *benchmark_input))
+            except Exception as e:
+                print(f"❌ AUDIO BENCHMARK ERROR on {name}: {e}")
+                result.update(status="FAILED", error=str(e))
+                return result
+            print(f"🎵 Audio processing: {result['audio_processing_s']:.3f}s for {result['audio_s']:.3f}s, processing speed {result['processing_speed']:.2f}x")
         print(f"✅ All checks for {name} passed successfully!")
-        return {"name": name, "status": "PASSED", "compile_s": t_compile, "warmup_s": t_warmup, "infer_s": t_infer, "error": ""}
+        return result
     finally:
         if temp_config_path and os.path.exists(temp_config_path):
             os.remove(temp_config_path)
@@ -920,6 +988,8 @@ def main():
     dummy_inputs = create_dummy_inputs(model_path)
     print(f"⏱️ Input tensors generated in {time.perf_counter() - t0:.3f}s")
 
+    audio_path = os.environ.get("BENCHMARK_AUDIO")
+    benchmark_input = load_benchmark_audio(audio_path) if audio_path else None
     results = []
     if any(t.get("ep") == "CUDAExecutionProvider" for t in targets):
         results.append(check_onnx_structure(model_path))
@@ -927,22 +997,40 @@ def main():
         results.append(check_polygraphy_capability(model_path))
     for target in targets:
         with report_target_progress(target.get("name", target.get("ep", "Target"))):
-            res = run_single_target(model_path, dummy_inputs, target)
+            res = run_single_target(model_path, dummy_inputs, target, benchmark_input=benchmark_input)
         if res["status"] == "SKIPPED":
             print(f"❌ Skipping is disabled: {res['name']} is reported as FAILED ({res.get('error', '')})")
             res["status"] = "FAILED"
         results.append(res)
 
-    # Print final summary table
-    print("\n==================================================================================")
-    print(f"{'Target':<36} | {'Status':<14} | {'Compile':<9} | {'Warmup':<9} | {'Steady':<9}")
-    print("----------------------------------------------------------------------------------")
-    has_failure = False
-    for r in results:
-        if r["status"] == "FAILED":
-            has_failure = True
-        print(f"{r['name']:<36} | {r['status']:<14} | {r['compile_s']:<9.3f} | {r['warmup_s']:<9.3f} | {r['infer_s']:<9.3f}")
-    print("==================================================================================")
+    headers = ("Target", "Status", "Compile (s)", "Warmup (s)", "Steady (s)", "Processing speed")
+    rows = [
+        (r["name"], r["status"], f"{r['compile_s']:.3f}", f"{r['warmup_s']:.3f}",
+         f"{r['infer_s']:.3f}", f"{r['processing_speed']:.2f}x" if "processing_speed" in r else "N/A")
+        for r in results
+    ]
+    widths = [max(len(str(row[i])) for row in [headers, *rows]) for i in range(len(headers))]
+
+    def format_row(row):
+        return " | ".join(str(value).ljust(widths[i]) if i < 2 else str(value).rjust(widths[i])
+                          for i, value in enumerate(row))
+
+    separator = "-+-".join("-" * width for width in widths)
+    print("\n" + format_row(headers))
+    print(separator)
+    for row in rows:
+        print(format_row(row))
+    has_failure = any(r["status"] == "FAILED" for r in results)
+    if audio_path and os.environ.get("GITHUB_STEP_SUMMARY"):
+        summary = ["| Target | Status | Compile (s) | Processing speed |", "| --- | --- | ---: | ---: |"]
+        for row in rows:
+            name, status, compile_time, _, _, speed = row
+            summary.append(f"| {name.replace('|', '/')} | {status} | {compile_time} | {speed} |")
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary_file:
+            summary_file.write("## Real-audio ONNX benchmark\n\n" + "\n".join(summary) + "\n\n")
+            summary_file.write("Processing speed is audio duration divided by processing time, excluding session initialization and warmup. "
+                               "Processing includes normalization, 25% overlapping model inference and reconstruction; file loading is excluded. "
+                               "CoreML compute units permit CPU fallback and do not guarantee GPU or Neural Engine placement.\n")
 
     sys.exit(1 if has_failure else 0)
 

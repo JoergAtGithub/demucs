@@ -3,9 +3,107 @@ import threading
 import time
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from scripts import test_onnx_ep as checks
+
+
+def test_audio_benchmark_covers_entire_track_and_reports_speed(monkeypatch):
+    audio = np.vstack([np.arange(10), np.arange(10) + 2]).astype(np.float32)
+    chunks = []
+
+    class Session:
+        def run(self, outputs, inputs):
+            chunk = inputs["input"]
+            chunks.append(chunk.copy())
+            return [chunk[:, None, :, :]]
+
+    times = iter([10.0, 12.0])
+    monkeypatch.setattr(checks.time, "perf_counter", lambda: next(times))
+    result = checks.benchmark_audio(Session(), {"input": np.zeros((1, 2, 4), dtype=np.float32)}, audio, 44100)
+    reference = audio.mean(axis=0)
+    expected = (audio - reference.mean()) / (reference.std(ddof=1) + 1e-8)
+
+    assert len(chunks) == 4
+    for chunk, offset in zip(chunks, [0, 3, 6, 9]):
+        count = min(4, 10 - offset)
+        np.testing.assert_allclose(chunk[0, :, :count], expected[:, offset:offset + count])
+        assert not chunk[0, :, count:].any()
+    assert result["audio_s"] == pytest.approx(10 / 44100)
+    assert result["audio_processing_s"] == 2.0
+    assert result["processing_speed"] == pytest.approx(10 / 44100 / 2)
+
+
+def test_audio_benchmark_rejects_invalid_input_and_output():
+    audio = np.zeros((2, 10), dtype=np.float32)
+    inputs = {"input": np.zeros((1, 2, 4), dtype=np.float32)}
+    session = SimpleNamespace(run=lambda *args: [np.zeros((1, 2, 4), dtype=np.float32)])
+    with pytest.raises(ValueError, match="44.1 kHz stereo"):
+        checks.benchmark_audio(session, inputs, audio, 48000)
+    with pytest.raises(ValueError, match="one .* output"):
+        checks.benchmark_audio(session, inputs, audio, 44100)
+
+
+def test_load_benchmark_audio_rejects_wrong_format(monkeypatch):
+    monkeypatch.setitem(checks.sys.modules, "soundfile", SimpleNamespace(
+        read=lambda *args, **kwargs: (np.zeros((4, 1), dtype=np.float32), 44100)))
+    with pytest.raises(ValueError, match="44.1 kHz stereo"):
+        checks.load_benchmark_audio("audio.wav")
+
+
+def test_main_reports_processing_speed_in_job_summary(monkeypatch, tmp_path, capsys):
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("BENCHMARK_AUDIO", "audio.wav")
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    monkeypatch.setenv("TEST_TARGETS", json.dumps([{"name": "CPU", "ep": "CPUExecutionProvider"}]))
+    monkeypatch.setattr(checks.sys, "argv", ["test_onnx_ep.py", "model.onnx"])
+    monkeypatch.setattr(checks, "create_dummy_inputs", lambda path: {})
+    benchmark_input = (np.zeros((2, 4), dtype=np.float32), 44100)
+    monkeypatch.setattr(checks, "load_benchmark_audio", lambda path: benchmark_input)
+
+    def run(model, inputs, target, benchmark_input=None):
+        assert benchmark_input is not None
+        return {"name": "CPU", "status": "PASSED", "compile_s": 1.25, "warmup_s": 0.1,
+                "infer_s": 0.2, "processing_speed": 12.1}
+
+    monkeypatch.setattr(checks, "run_single_target", run)
+    with pytest.raises(SystemExit) as result:
+        checks.main()
+    assert result.value.code == 0
+    output = capsys.readouterr().out
+    assert "Processing speed" in output and "12.10x" in output
+    assert "Audio speed" not in output
+    text = summary.read_text(encoding="utf-8")
+    assert "| CPU | PASSED | 1.250 | 12.10x |" in text
+    assert "Processing speed" in text and "Audio speed" not in text
+    assert "do not guarantee GPU or Neural Engine placement" in text
+
+
+def test_summary_columns_align_for_long_names_and_missing_processing_speed(monkeypatch, capsys):
+    targets = [{"name": "A very long target name that exceeds the original table width", "ep": "CPUExecutionProvider"},
+               {"name": "Short", "ep": "CPUExecutionProvider"}]
+    monkeypatch.delenv("BENCHMARK_AUDIO", raising=False)
+    monkeypatch.setenv("TEST_TARGETS", json.dumps(targets))
+    monkeypatch.setattr(checks.sys, "argv", ["test_onnx_ep.py", "model.onnx"])
+    monkeypatch.setattr(checks, "create_dummy_inputs", lambda path: {})
+
+    def run(model, inputs, target, benchmark_input=None):
+        return {"name": target["name"], "status": "PASSED", "compile_s": 123456789.123,
+                "warmup_s": 0.1, "infer_s": 0.2}
+
+    monkeypatch.setattr(checks, "run_single_target", run)
+    with pytest.raises(SystemExit) as result:
+        checks.main()
+    assert result.value.code == 0
+    lines = capsys.readouterr().out.splitlines()
+    header_index = next(i for i, line in enumerate(lines) if line.startswith("Target ") and "Processing speed" in line)
+    header, separator, *rows = lines[header_index:header_index + 4]
+    positions = [i for i, char in enumerate(header) if char == "|"]
+    assert len(positions) == 5
+    assert [i for i, char in enumerate(separator) if char == "+"] == positions
+    assert all([i for i, char in enumerate(row) if char == "|"] == positions for row in rows)
+    assert all(row.endswith("N/A") for row in rows)
 
 
 @pytest.mark.parametrize("platform", ["3720", "4000", "5010", "5020", "6010"])
